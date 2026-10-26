@@ -1,5 +1,4 @@
 using UnityEngine;
-using UnityEngine.XR;
 
 public class FollowBall : MonoBehaviour
 {
@@ -23,6 +22,11 @@ public class FollowBall : MonoBehaviour
     private Vector3 behind = Vector3.back;
     private float rotationResponse = 2.5f; // - 0.01 slow / 3++++ fast
 
+
+    //--aim value
+    float aimValue;
+
+
     private void Awake()
     {
         transform.LookAt(ball.position);
@@ -45,9 +49,28 @@ public class FollowBall : MonoBehaviour
         new_lookOffsetY = 0.68f;
     }
 
+    bool isAiming = false;
+    public void AimAngle(float _aim = 0)
+    {
+        if (_aim < -0.1 || _aim > 0.1f) // aim with non 0 values
+        {
+            isAiming = true;
+            transform.RotateAround(ball.position, Vector3.up, _aim *Time.deltaTime * 100f);
+            //new_height = 0.4f;
+        }
+    }
+
+    public void StoppedAiming()
+    {
+        isAiming = false;
+        
+    }
+
+
 
     private void Update() //smoothly follow the new values with different increments
     {
+        if (isAiming) return;
         height -= ( height - new_height) / 1.02f * Time.deltaTime;
         distance -= ( distance - new_distance) / 0.02f * Time.deltaTime;
         cameraOffsetY -= (cameraOffsetY - new_cameraOffsetY) / 0.02f * Time.deltaTime;
@@ -56,17 +79,29 @@ public class FollowBall : MonoBehaviour
 
     void LateUpdate()
     {
+        if (isAiming) return;
         Vector3 velocity = ball.linearVelocity; // get velocity of the ball
         velocity.y = 0f; // ingore Y
         if (velocity.sqrMagnitude > 0.25f) // stop rotating when movement is slow! (prevetnts stange angles when ball is slowing down)
             behind = Vector3.RotateTowards( behind, -velocity.normalized,rotationResponse * Time.deltaTime, 0f);// look at ball (with smooth delay)
 
-        Vector3 targetPosition = ball.position + behind * distance + Vector3.up * (height + cameraOffsetY); // taget pos = (ball position + dinstace + cameraY offset)
+
+
+
+
+        Vector3 targetPosition = ball.position + behind * distance + Vector3.up * (height + cameraOffsetY);
 
         transform.position = Vector3.Lerp( transform.position, targetPosition, followSpeed * Time.deltaTime); // smooth movement
 
+       
+
+
         Vector3 lookTarget = ball.position + Vector3.up * lookOffsetY; // look targt + offset on Y
         Vector3 lookDirection = lookTarget - transform.position; // look direction = (look target - position)
+
+
+       
+
 
         Quaternion targetRotation = Quaternion.LookRotation(lookDirection); // direction
         transform.rotation = Quaternion.Slerp( transform.rotation, targetRotation, 1f - Mathf.Exp( -rotationSpeed * Time.deltaTime)); // slow smooth rotation over time

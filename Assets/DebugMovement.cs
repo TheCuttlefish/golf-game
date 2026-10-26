@@ -1,7 +1,7 @@
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
-public class BallDebugMovment : MonoBehaviour
+public class DebugMovement : MonoBehaviour
 {
     private Rigidbody rb;
     private Transform cameraTransform;

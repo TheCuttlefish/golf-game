@@ -20,8 +20,9 @@ public class BallPhysics : MonoBehaviour
         }
 
         //this gets rid of the jitter when the ball cannot slow down on a small slope (and keeps rolling / jittering)
-        if (rb.linearVelocity.magnitude < .01f) rb.linearVelocity = -rb.linearVelocity; // if extremly small movement - slow it down by revesting veolcity
+        if (rb.linearVelocity.magnitude < .02f) rb.linearVelocity = -rb.linearVelocity; // if extremly small movement - slow it down by revesting veolcity
 
+        
 
 
 
