@@ -25,6 +25,10 @@ public class PlayerMovementExample : MonoBehaviour
         powerUI = GameObject.Find("power-slider").GetComponent<Slider>();
     }
 
+    public Vector3 oldPos;
+    float timer;
+
+    int waitingCounter = 0;
     // Update is called once per frame
     void Update()
     {
@@ -40,9 +44,29 @@ public class PlayerMovementExample : MonoBehaviour
             powerUI.value = power;
         }
 
-        
 
-        if (rb.angularVelocity.magnitude < 0.01f) // if ball is not moving you can aim and shoot!
+        if(timer == 0) oldPos = transform.position;
+        timer += Time.deltaTime;
+
+
+       
+        if (timer > 0.1f)
+        {
+            if (transform.position == oldPos)
+            {
+                waitingCounter++;
+            }
+            else
+            {
+                waitingCounter = 0;
+            }
+            timer = 0;
+        }
+
+      
+        //previous solution
+        //if (rb.angularVelocity.magnitude < 0.01f) // if ball is not moving you can aim and shoot!
+        if(waitingCounter > 3)//check 3 times x 0.1 seconds - if the pos is the same
         {
            
             canShoot = true;
@@ -69,6 +93,7 @@ public class PlayerMovementExample : MonoBehaviour
             {
                 Camera.main.GetComponent<FollowBall>().StoppedAiming();
                 powerUI.GetComponent<CanvasGroup>().alpha = 0;
+                waitingCounter = 0; // reset counter
                 canShoot=false;
             }
 
