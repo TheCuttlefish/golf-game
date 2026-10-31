@@ -36,7 +36,27 @@ public static class BlenderAddMenu
         Vector3 position = view.pivot;
         Quaternion rotation = view.rotation;
         e.Use();
-        PopupWindow.Show(new Rect(at.x, at.y, 1, 1), new AddPopup(position, rotation));
+        PopupWindow.Show(FindOpeningRect(view, at), new AddPopup(position, rotation));
+    }
+
+    // Position the *compact* popup with room for its eventual second column.
+    // The menu itself still expands/collapses exactly as before.
+    private static Rect FindOpeningRect(SceneView view, Vector2 mouseGUI)
+    {
+        const float expandedWidth = 408f; // 2 * AddPopup.ColumnWidth
+        const float expandedHeight = 440f; // room for the longest normal submenu
+        const float margin = 8f;
+
+        Vector2 screen = GUIUtility.GUIToScreenPoint(mouseGUI);
+        Rect bounds = view.position; // editor window bounds in screen coordinates
+        float left = bounds.xMin + margin;
+        float right = Mathf.Max(left, bounds.xMax - expandedWidth - margin);
+        float top = bounds.yMin + margin;
+        float bottom = Mathf.Max(top, bounds.yMax - expandedHeight - margin);
+        screen.x = Mathf.Clamp(screen.x, left, right);
+        screen.y = Mathf.Clamp(screen.y, top, bottom);
+        Vector2 gui = GUIUtility.ScreenToGUIPoint(screen);
+        return new Rect(gui.x, gui.y, 1f, 1f);
     }
 
     private sealed class AddPopup : PopupWindowContent

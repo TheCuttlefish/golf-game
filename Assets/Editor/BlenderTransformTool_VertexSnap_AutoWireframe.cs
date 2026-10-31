@@ -23,14 +23,22 @@ public static class BlenderTransformTool
     private static Vector3 startPosition, startScale;
     private static Quaternion startRotation;
     private static Vector2 startMouse, lastMouse;
+    // Virtual cursor accumulates fine motion while Shift is held, without jumps.
+    private static Vector2 precisionMouse, previousPhysicalMouse;
+    private const float PrecisionFactor = 0.15f;
+    private static Vector2 FineMouse(Vector2 physical) => precisionMouse;
+
     private static Vector2 pivotScreen;
     private static char axis;
+    private static bool moveLocalAxis;
+    private static bool rotateLocalAxis;
     private static float startRadius;
     private static Vector3 startPlanePoint;
     private static Vector3 movePlaneNormal;
     private static Vector3 startPlaneHit;
     private static float rotationAngle;
     private static float accumulatedMouseAngle;
+    private static float freeArcZeroAngle;
     private static Vector2 previousRotationVector;
     private static bool rotationVectorReady;
     private static Quaternion trackballDelta;
@@ -44,6 +52,34 @@ public static class BlenderTransformTool
     private static bool ctrlHeld;
     private static bool moveSnapAnchorSet;
     private static Vector3 moveSnapAnchor;
+
+    // Temporary Scene View display override for G -> B vertex snapping.
+    private static SceneView vertexWireScene;
+    private static SceneView.CameraMode vertexPreviousCameraMode;
+    private static bool vertexWireActive;
+
+    private static void EnableVertexWireframe(SceneView scene)
+    {
+        if (vertexWireActive || scene == null) return;
+        vertexWireScene = scene;
+        vertexPreviousCameraMode = scene.cameraMode;
+        vertexWireActive = true;
+        SceneView.CameraMode wireMode = SceneView.GetBuiltinCameraMode(DrawCameraMode.TexturedWire);
+        scene.cameraMode = wireMode;
+        scene.Repaint();
+    }
+
+    private static void RestoreVertexWireframe()
+    {
+        if (!vertexWireActive) return;
+        if (vertexWireScene != null)
+        {
+            vertexWireScene.cameraMode = vertexPreviousCameraMode;
+            vertexWireScene.Repaint();
+        }
+        vertexWireActive = false;
+        vertexWireScene = null;
+    }
 
     private static bool vertexSnapMode;
     private static Vector3 vertexSnapSource;
@@ -166,7 +202,7 @@ public static class BlenderTransformTool
                 ctrlHeld = e.control || e.command;
                 if (ctrlHeld) CaptureMoveSnapAnchor();
                 else ResetMoveSnapMarkers();
-                UpdateTransform(e.mousePosition, scene);
+                UpdateTransform(FineMouse(e.mousePosition), scene);
             }
             // Capture input so Unity's built-in selection/handles don't interfere.
             if (e.type == EventType.Layout) HandleUtility.AddDefaultControl(GUIUtility.GetControlID(FocusType.Passive));
@@ -178,7 +214,7 @@ public static class BlenderTransformTool
                     ctrlHeld = e.type == EventType.KeyDown;
                     if (ctrlHeld) CaptureMoveSnapAnchor();
                     else ResetMoveSnapMarkers();
-                    UpdateTransform(e.mousePosition, scene);
+                    UpdateTransform(FineMouse(e.mousePosition), scene);
                     e.Use();
                 }
             }
@@ -196,22 +232,30 @@ public static class BlenderTransformTool
                 else if (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter)
                 { Confirm(); e.Use(); }
                 else if (e.keyCode == KeyCode.Backspace && numericInput.Length > 0)
-                { numericInput = numericInput.Substring(0, numericInput.Length - 1); UpdateTransform(e.mousePosition, scene); e.Use(); }
+                { numericInput = numericInput.Substring(0, numericInput.Length - 1); UpdateTransform(FineMouse(e.mousePosition), scene); e.Use(); }
                 else if (TryAppendNumber(e))
-                { UpdateTransform(e.mousePosition, scene); e.Use(); }
+                { UpdateTransform(FineMouse(e.mousePosition), scene); e.Use(); }
                 else if (numericInput.Length == 0 && (e.keyCode == KeyCode.X || e.keyCode == KeyCode.Y || e.keyCode == KeyCode.Z))
                 {
                     char requested = e.keyCode == KeyCode.X ? 'X' : e.keyCode == KeyCode.Y ? 'Y' : 'Z';
-                    char newAxis = axis == requested ? '\0' : requested;
+                    bool repeatedMoveAxis = mode == Mode.Move && axis == requested && !e.shift;
+                    if (mode == Mode.Move)
+                        moveLocalAxis = repeatedMoveAxis ? !moveLocalAxis : false;
+                    bool repeatedRotateAxis = mode == Mode.Rotate && axis == requested && !e.shift;
+                    bool nextRotateLocal = repeatedRotateAxis ? !rotateLocalAxis : false;
+                    char newAxis = mode == Mode.Move || mode == Mode.Rotate ? requested :
+                        (axis == requested && planarScale == e.shift ? '\0' : requested);
+                    planarScale = mode == Mode.Scale && e.shift && newAxis != '\0';
                     if (mode == Mode.Rotate || mode == Mode.Trackball)
                     {
-                        // X/Y/Z in trackball mode switches to ordinary axis rotation.
-                        // Preserve the current visible orientation as the new baseline.
+                        // Preserve the current orientation and reset the dial's baseline
+                        // before changing the rotation plane.
                         RebaseDuplicateOperation(e.mousePosition, scene, Mode.Rotate);
+                        rotateLocalAxis = nextRotateLocal;
                     }
                     axis = newAxis;
-                    lastMouse = e.mousePosition;
-                    UpdateTransform(e.mousePosition, scene);
+                    lastMouse = FineMouse(e.mousePosition);
+                    UpdateTransform(FineMouse(e.mousePosition), scene);
                     e.Use();
                 }
                 else if (e.keyCode == KeyCode.G || e.keyCode == KeyCode.R || e.keyCode == KeyCode.S)
@@ -231,9 +275,14 @@ public static class BlenderTransformTool
                 else if (e.keyCode == KeyCode.B && mode == Mode.Move && numericInput.Length == 0)
                 {
                     vertexSnapMode = !vertexSnapMode;
+                    if (vertexSnapMode) EnableVertexWireframe(scene);
+                    else RestoreVertexWireframe();
                     vertexSourceChosen = false;
                     vertexDestinationFound = false;
                     axis = '\0';
+        moveLocalAxis = false;
+        rotateLocalAxis = false;
+        planarScale = false;
                     if (vertexSnapMode)
                     {
                         // Start the pick from the original position, not the
@@ -241,10 +290,16 @@ public static class BlenderTransformTool
                         for (int i = 0; i < targets.Length; i++)
                             if (targets[i]) targets[i].position = startPositions[i];
                     }
-                    else UpdateTransform(e.mousePosition, scene);
+                    else UpdateTransform(FineMouse(e.mousePosition), scene);
                     e.Use();
                 }
                 else { e.Use(); } // Suppress other Scene View shortcuts during a modal transform.
+            }
+            if (e.type == EventType.MouseMove || e.type == EventType.MouseDrag)
+            {
+                Vector2 physicalDelta = e.mousePosition - previousPhysicalMouse;
+                previousPhysicalMouse = e.mousePosition;
+                precisionMouse += physicalDelta * (e.shift && mode != Mode.Rotate && mode != Mode.Trackball ? PrecisionFactor : 1f);
             }
             if ((e.type == EventType.MouseMove || e.type == EventType.MouseDrag) && numericInput.Length == 0)
             {
@@ -256,7 +311,7 @@ public static class BlenderTransformTool
                     // Subtract the initial pivot-relative angles so entering trackball
                     // never causes a sudden rotation jump.
                     Vector2 pivot = HandleUtility.WorldToGUIPoint(RotationPivot());
-                    Vector2 fromCenter = e.mousePosition - pivot;
+                    Vector2 fromCenter = FineMouse(e.mousePosition) - pivot;
                     Vector2 initialFromCenter = startMouse - pivot;
                     // Radius adapts to the model's on-screen position and the cursor's
                     // initial offset. Clamp it to keep movement predictable nearby.
@@ -270,9 +325,9 @@ public static class BlenderTransformTool
                     Quaternion pitch = Quaternion.AngleAxis(-vertical,
                                                              trackballCameraRotation * Vector3.right);
                     trackballDelta = yaw * pitch;
-                    lastMouse = e.mousePosition;
+                    lastMouse = FineMouse(e.mousePosition);
                 }
-                if (!vertexSnapMode || vertexSourceChosen) UpdateTransform(e.mousePosition, scene);
+                if (!vertexSnapMode || vertexSourceChosen) UpdateTransform(FineMouse(e.mousePosition), scene);
                 e.Use();
             }
             if (e.type == EventType.MouseDown && e.button == 0)
@@ -284,7 +339,7 @@ public static class BlenderTransformTool
                         vertexSnapSource = source;
                         vertexSourceChosen = true;
                         vertexDestinationFound = false;
-                        UpdateTransform(e.mousePosition, scene);
+                        UpdateTransform(FineMouse(e.mousePosition), scene);
                     }
                     e.Use();
                 }
@@ -357,16 +412,20 @@ public static class BlenderTransformTool
         duplicating = true;
         Begin(e, scene);
         mode = Mode.Move;
-        UpdateTransform(e.mousePosition, scene);
+        UpdateTransform(FineMouse(e.mousePosition), scene);
         Undo.CollapseUndoOperations(undoGroup);
     }
 
     private static void Begin(Event e, SceneView scene)
     {
+        RestoreVertexWireframe();
         target = Selection.activeTransform;
         if (!target) return;
         mode = e.keyCode == KeyCode.G ? Mode.Move : e.keyCode == KeyCode.R ? Mode.Rotate : Mode.Scale;
         axis = '\0';
+        moveLocalAxis = false;
+        rotateLocalAxis = false;
+        planarScale = false;
         vertexSnapMode = false;
         vertexSourceChosen = false;
         vertexDestinationFound = false;
@@ -403,10 +462,12 @@ public static class BlenderTransformTool
         startRotation = target.rotation;
         startScale = target.localScale;
         startMouse = lastMouse = e.mousePosition;
+        precisionMouse = previousPhysicalMouse = e.mousePosition;
         pivotScreen = HandleUtility.WorldToGUIPoint(pivotModeAtStart == PivotMode.Center ? groupCenter : startPosition);
         startRadius = Mathf.Max(12f, Vector2.Distance(startMouse, pivotScreen));
         rotationAngle = 0;
         accumulatedMouseAngle = 0f;
+        freeArcZeroAngle = Mathf.Atan2(startMouse.y - pivotScreen.y, startMouse.x - pivotScreen.x);
         previousRotationVector = startMouse - pivotScreen;
         rotationVectorReady = previousRotationVector.sqrMagnitude > 16f;
         trackballDelta = Quaternion.identity;
@@ -459,6 +520,12 @@ public static class BlenderTransformTool
         return plane.Raycast(ray, out float distance) ? ray.GetPoint(distance) : fallback;
     }
 
+    private static Vector3 MoveAxisVector()
+    {
+        Vector3 direction = AxisVector();
+        return moveLocalAxis ? (startRotation * direction).normalized : direction;
+    }
+
     private static Vector3 AxisVector()
     {
         return axis == 'X' ? Vector3.right : axis == 'Y' ? Vector3.up : Vector3.forward;
@@ -472,7 +539,7 @@ public static class BlenderTransformTool
     private static Vector3 RotationPlaneNormal(SceneView scene)
     {
         Vector3 n = axis == '\0' ? scene.camera.transform.forward : AxisVector();
-        if (axis != '\0' && pivotRotationAtStart == PivotRotation.Local)
+        if (axis != '\0' && rotateLocalAxis)
             n = startRotation * n;
         return n.normalized;
     }
@@ -497,12 +564,24 @@ public static class BlenderTransformTool
         return zero.normalized;
     }
 
+    // Shift + X/Y/Z constrains scale to the plane perpendicular to that axis.
+    private static bool planarScale;
+
     private static Color RotationGuideColor(bool snapping)
     {
+        if (rotateLocalAxis && mode == Mode.Rotate && axis != '\0')
+        {
+            Color baseColor = axis == 'X' ? new Color(0.96f, 0.31f, 0.31f, 1f) :
+                              axis == 'Y' ? new Color(0.30f, 0.85f, 0.39f, 1f) :
+                                            new Color(0.32f, 0.57f, 1f, 1f);
+            return new Color(baseColor.r * 0.72f, baseColor.g * 0.72f, baseColor.b * 0.72f,
+                snapping ? 1f : 0.9f);
+        }
         if (axis == 'X') return snapping ? new Color(1f, 0.43f, 0.43f, 1f) : new Color(0.96f, 0.31f, 0.31f, 0.9f);
         if (axis == 'Y') return snapping ? new Color(0.42f, 1f, 0.53f, 1f) : new Color(0.30f, 0.85f, 0.39f, 0.9f);
         if (axis == 'Z') return snapping ? new Color(0.42f, 0.72f, 1f, 1f) : new Color(0.32f, 0.57f, 1f, 0.9f);
-        return snapping ? new Color(0.35f, 0.94f, 0.48f, 0.95f) : new Color(1f, 0.72f, 0.32f, 0.85f);
+        return snapping && mode == Mode.Rotate ? Color.white :
+               snapping ? new Color(0.35f, 0.94f, 0.48f, 0.95f) : new Color(1f, 0.72f, 0.32f, 0.85f);
     }
 
     private static void UpdateTransform(Vector2 mouse, SceneView scene)
@@ -517,6 +596,12 @@ public static class BlenderTransformTool
             else if (ctrlHeld) factor = Mathf.Max(0.001f, 1f + Mathf.Round((factor - 1f) / ScaleSnap) * ScaleSnap);
             Vector3 scale = startScale;
             if (axis == '\0') scale *= factor;
+            else if (planarScale)
+            {
+                if (axis != 'X') scale.x *= factor;
+                if (axis != 'Y') scale.y *= factor;
+                if (axis != 'Z') scale.z *= factor;
+            }
             else if (axis == 'X') scale.x *= factor;
             else if (axis == 'Y') scale.y *= factor;
             else scale.z *= factor;
@@ -538,7 +623,7 @@ public static class BlenderTransformTool
             if (axis != '\0')
             {
                 // Project the mouse displacement onto the axis as viewed on screen.
-                Vector3 a = AxisVector();
+                Vector3 a = MoveAxisVector();
                 Vector2 screenAxis = HandleUtility.WorldToGUIPoint(startPosition + a) -
                                      HandleUtility.WorldToGUIPoint(startPosition);
                 if (screenAxis.sqrMagnitude > 0.0001f)
@@ -564,7 +649,7 @@ public static class BlenderTransformTool
             }
             else if (hasNumber)
             {
-                Vector3 direction = axis == '\0' ? (movement.sqrMagnitude > 0.000001f ? movement.normalized : scene.camera.transform.right) : AxisVector();
+                Vector3 direction = axis == '\0' ? (movement.sqrMagnitude > 0.000001f ? movement.normalized : scene.camera.transform.right) : MoveAxisVector();
                 movement = direction * number;
             }
             else if (ctrlHeld)
@@ -585,7 +670,7 @@ public static class BlenderTransformTool
                 }
                 else
                 {
-                    Vector3 direction = AxisVector();
+                    Vector3 direction = MoveAxisVector();
                     float step = Mathf.Max(0.0001f, Mathf.Abs(axis == 'X' ? MoveSnap.x : axis == 'Y' ? MoveSnap.y : MoveSnap.z));
                     snappedOffset = direction * (Mathf.Round(Vector3.Dot(fromAnchor, direction) / step) * step);
                 }
@@ -664,7 +749,7 @@ public static class BlenderTransformTool
         {
             if (!targets[i]) continue;
             Quaternion delta = worldDelta;
-            if (pivotRotationAtStart == PivotRotation.Local && axis != '\0')
+            if (rotateLocalAxis && axis != '\0')
             {
                 Vector3 localAxis = AxisVector();
                 delta = Quaternion.AngleAxis(rotationAngle, startRotations[i] * localAxis);
@@ -697,11 +782,13 @@ public static class BlenderTransformTool
         startRotation = target.rotation;
         startScale = target.localScale;
         startMouse = lastMouse = mouse;
+        precisionMouse = previousPhysicalMouse = mouse;
         pivotScreen = HandleUtility.WorldToGUIPoint(
             pivotModeAtStart == PivotMode.Center ? groupCenter : startPosition);
         startRadius = Mathf.Max(12f, Vector2.Distance(mouse, pivotScreen));
         rotationAngle = 0f;
         accumulatedMouseAngle = 0f;
+        freeArcZeroAngle = Mathf.Atan2(mouse.y - pivotScreen.y, mouse.x - pivotScreen.x);
         previousRotationVector = mouse - pivotScreen;
         rotationVectorReady = previousRotationVector.sqrMagnitude > 16f;
         trackballDelta = Quaternion.identity;
@@ -710,7 +797,11 @@ public static class BlenderTransformTool
         startPlanePoint = startPosition;
         startPlaneHit = MousePlaneHit(mouse, startPlanePoint, movePlaneNormal, startPosition);
         axis = '\0';
+        moveLocalAxis = false;
+        rotateLocalAxis = false;
+        planarScale = false;
         numericInput = "";
+        RestoreVertexWireframe();
         vertexSnapMode = false;
         vertexSourceChosen = false;
         vertexDestinationFound = false;
@@ -784,6 +875,7 @@ public static class BlenderTransformTool
 
     private static void Finish()
     {
+        RestoreVertexWireframe();
         mode = Mode.None;
         duplicating = false;
         originalSelections = null;
@@ -791,6 +883,9 @@ public static class BlenderTransformTool
         target = null;
         targets = System.Array.Empty<Transform>();
         axis = '\0';
+        moveLocalAxis = false;
+        rotateLocalAxis = false;
+        planarScale = false;
         ctrlHeld = false;
         moveSnapAnchorSet = false;
         numericInput = "";
@@ -919,13 +1014,47 @@ public static class BlenderTransformTool
         return count > 0 ? sum / count : (target ? target.position : Vector3.zero);
     }
 
+    // Counts mesh triangles in the selected hierarchies. Nested selections are
+    // counted once, and shared mesh instances count once per rendered object.
+    private static long SelectedTriangleCount()
+    {
+        long total = 0;
+        var visited = new System.Collections.Generic.HashSet<int>();
+        foreach (GameObject selected in Selection.gameObjects)
+        {
+            if (!selected) continue;
+            foreach (MeshFilter filter in selected.GetComponentsInChildren<MeshFilter>(true))
+            {
+                if (!filter || !visited.Add(filter.GetInstanceID())) continue;
+                Mesh mesh = filter.sharedMesh;
+                if (mesh) total += MeshTriangleCount(mesh);
+            }
+            foreach (SkinnedMeshRenderer renderer in selected.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+            {
+                if (!renderer || !visited.Add(renderer.GetInstanceID())) continue;
+                Mesh mesh = renderer.sharedMesh;
+                if (mesh) total += MeshTriangleCount(mesh);
+            }
+        }
+        return total;
+    }
+
+    private static long MeshTriangleCount(Mesh mesh)
+    {
+        long count = 0;
+        for (int i = 0; i < mesh.subMeshCount; i++)
+            if (mesh.GetTopology(i) == MeshTopology.Triangles)
+                count += (long)mesh.GetIndexCount(i) / 3;
+        return count;
+    }
+
     private static void DrawOverlay(SceneView scene)
     {
         // Draw a Blender-style colored guide through the transform pivot.
-        if (mode != Mode.None && mode != Mode.Move && axis != '\0' && target && Event.current.type == EventType.Repaint)
+        if (mode == Mode.Rotate && axis != '\0' && target && Event.current.type == EventType.Repaint)
         {
             Vector3 direction = AxisVector();
-            if (pivotRotationAtStart == PivotRotation.Local && mode == Mode.Rotate)
+            if (rotateLocalAxis && mode == Mode.Rotate)
                 direction = startRotation * direction;
             Vector3 anchor = pivotModeAtStart == PivotMode.Center ? groupCenter : startPosition;
             // Fixed world-space length, matching the grid's unit-based behavior.
@@ -935,10 +1064,80 @@ public static class BlenderTransformTool
             Handles.color = axis == 'X' ? new Color(1f, 0.27f, 0.27f, 0.8f) :
                             axis == 'Y' ? new Color(0.32f, 0.92f, 0.40f, 0.8f) :
                                           new Color(0.32f, 0.60f, 1f, 0.8f);
+            if (rotateLocalAxis) Handles.color = RotationGuideColor(false);
             Handles.DrawAAPolyLine(mode == Mode.Move ? 3f : 2f, anchor - direction * extent, anchor + direction * extent);
             Handles.color = oldColor;
         }
         Handles.BeginGUI();
+        // G movement cue: white, heavier four-way icon at the live pivot.
+        // On constrained moves, show the displacement from the original pivot.
+        if (mode == Mode.Move && !vertexSnapMode && target && Event.current.type == EventType.Repaint)
+        {
+            Vector3 worldPivot = pivotModeAtStart == PivotMode.Center
+                ? CurrentSelectionCenter() : target.position;
+            Vector2 center = HandleUtility.WorldToGUIPoint(worldPivot);
+            Color previous = Handles.color;
+            // One opaque, uniform color for the entire G icon (no translucent overlaps).
+            // Unconstrained = white; X/Y/Z = red/green/blue.
+            Color moveIconColor = axis == 'X' ? new Color(0.96f, 0.31f, 0.31f, 1f) :
+                                  axis == 'Y' ? new Color(0.30f, 0.85f, 0.39f, 1f) :
+                                  axis == 'Z' ? new Color(0.32f, 0.57f, 1f, 1f) :
+                                                Color.white;
+            if (moveLocalAxis && axis != '\0')
+                moveIconColor = new Color(moveIconColor.r * 0.72f, moveIconColor.g * 0.72f, moveIconColor.b * 0.72f, 1f);
+            if (axis == '\0')
+            {
+                // Free movement keeps the four-way icon.
+                Handles.color = moveIconColor;
+                const float inner = 4f;
+                const float outer = 14f;
+                const float stroke = 3.6f;
+                Vector2[] dirs = { Vector2.up, Vector2.down, Vector2.left, Vector2.right };
+                foreach (Vector2 dir in dirs)
+                {
+                    Vector2 tip = center + dir * outer;
+                    Vector2 start = center + dir * inner;
+                    Vector2 side = new Vector2(-dir.y, dir.x);
+                    Vector2 basePoint = tip - dir * 6f;
+                    Handles.DrawAAPolyLine(stroke, new Vector3(start.x, start.y, 0),
+                        new Vector3(tip.x, tip.y, 0));
+                    Handles.DrawAAPolyLine(stroke,
+                        new Vector3((basePoint + side * 5.5f).x, (basePoint + side * 5.5f).y, 0),
+                        new Vector3(tip.x, tip.y, 0),
+                        new Vector3((basePoint - side * 5.5f).x, (basePoint - side * 5.5f).y, 0));
+                }
+            }
+            else
+            {
+                // Axis movement: original-position dot, displacement line, and
+                // a single soft arrowhead at the object's current position.
+                Vector3 originalPivot = pivotModeAtStart == PivotMode.Center ? groupCenter : startPosition;
+                Vector2 from = HandleUtility.WorldToGUIPoint(originalPivot);
+                Vector2 delta = center - from;
+                Handles.color = moveIconColor;
+                Handles.DrawSolidDisc(new Vector3(from.x, from.y, 0), Vector3.forward, 4f);
+                if (delta.sqrMagnitude > 1f)
+                {
+                    Handles.DrawAAPolyLine(2.8f, new Vector3(from.x, from.y, 0),
+                        new Vector3(center.x, center.y, 0));
+                    // Arrowhead points in the actual on-screen displacement direction.
+                    // Hide it when movement is too small to display cleanly.
+                    if (delta.magnitude > 12f)
+                    {
+                        Vector2 dir = delta.normalized;
+                        Vector2 side = new Vector2(-dir.y, dir.x);
+                        Vector2 back = center - dir * 8f;
+                        Vector2 wingA = back + side * 8f;
+                        Vector2 wingB = back - side * 8f;
+                        Handles.DrawAAPolyLine(3f,
+                            new Vector3(wingA.x, wingA.y, 0),
+                            new Vector3(center.x, center.y, 0),
+                            new Vector3(wingB.x, wingB.y, 0));
+                    }
+                }
+            }
+            Handles.color = previous;
+        }
         // Stationary snap preview: anchor once when Ctrl snapping starts.
         // Points remain in world space while the selected object moves.
         if (mode == Mode.Move && ctrlHeld && !vertexSnapMode && target &&
@@ -1079,6 +1278,88 @@ public static class BlenderTransformTool
                 Handles.color = previous;
             }
         }
+        // Scale guide: short outer T caps and inner dots, separated by a variable dotted gap.
+        // GUI-space drawing keeps line weight and endpoint dots constant while zooming.
+        if (mode == Mode.Scale && target && Event.current.type == EventType.Repaint)
+        {
+            Vector3 scalePivot = pivotModeAtStart == PivotMode.Center
+                ? CurrentSelectionCenter() : target.position;
+            Vector2 objectPoint = HandleUtility.WorldToGUIPoint(scalePivot);
+            Vector2 cursorPoint = Event.current.mousePosition;
+            Vector2 delta = cursorPoint - objectPoint;
+            float distance = delta.magnitude;
+            if (distance > 12f)
+            {
+                Vector2 along = delta / distance;
+                Vector2 perpendicular = new Vector2(-along.y, along.x);
+                // Keep the solid end segments short and constant at large distances.
+                // At close range, preserve the existing proportional layout.
+                float endSegmentLength = Mathf.Min(distance * 0.39f, 28f);
+                float scaleGuideGap = distance - 2f * endSegmentLength;
+                Vector2 firstTip = objectPoint + along * endSegmentLength;
+                Vector2 secondTip = cursorPoint - along * endSegmentLength;
+                Color previous = Handles.color;
+                Color orange = planarScale ? new Color(0.96f, 0.96f, 0.96f, 0.94f) :
+                    axis == '\0' ? new Color(1f, 0.72f, 0.32f, 0.92f) : RotationGuideColor(false);
+                Handles.color = orange;
+                const float stroke = 3f; // Match the rotation guide stroke width.
+                const float capHalfWidth = 6.75f; // Three times wider T crossbars; unchanged stroke weight.
+                Handles.DrawAAPolyLine(stroke, objectPoint, firstTip);
+                Handles.DrawAAPolyLine(stroke, cursorPoint, secondTip);
+                // Short perpendicular T caps at the ends of the solid segments.
+                Handles.DrawAAPolyLine(stroke,
+                    objectPoint + perpendicular * capHalfWidth,
+                    objectPoint - perpendicular * capHalfWidth);
+                Handles.DrawAAPolyLine(stroke,
+                    cursorPoint + perpendicular * capHalfWidth,
+                    cursorPoint - perpendicular * capHalfWidth);
+                // Faint dotted connection across the open space.
+                Handles.color = new Color(orange.r, orange.g, orange.b, 0.30f);
+                const float dotSpacing = 9f;
+                for (float offset = 5f; offset < scaleGuideGap - 3f; offset += dotSpacing)
+                {
+                    Vector2 dot = firstTip + along * offset;
+                    Handles.DrawSolidDisc(new Vector3(dot.x, dot.y, 0f), Vector3.forward, 1.1f);
+                }
+                Handles.color = orange;
+                Handles.DrawSolidDisc(new Vector3(firstTip.x, firstTip.y, 0f), Vector3.forward, 3.5f);
+                Handles.DrawSolidDisc(new Vector3(secondTip.x, secondTip.y, 0f), Vector3.forward, 3.5f);
+                Handles.color = previous;
+            }
+        }
+        // R -> R trackball: single-stroke white ring, with tether starting at its edge.
+        if (mode == Mode.Trackball && target && Event.current.type == EventType.Repaint)
+        {
+            Vector2 pivot = HandleUtility.WorldToGUIPoint(RotationPivot());
+            Vector2 cursor = Event.current.mousePosition;
+            Color oldColor = Handles.color;
+            Color trackballWhite = Color.white;
+            const float stroke = 3f;
+            const float ringRadius = 13f;
+            Handles.color = trackballWhite;
+
+            // Draw one circular outline at the same weight as the tether.
+            const int segments = 64;
+            Vector3[] ring = new Vector3[segments + 1];
+            for (int i = 0; i <= segments; i++)
+            {
+                float angle = i * Mathf.PI * 2f / segments;
+                ring[i] = new Vector3(pivot.x + Mathf.Cos(angle) * ringRadius,
+                                      pivot.y + Mathf.Sin(angle) * ringRadius, 0f);
+            }
+            Handles.DrawAAPolyLine(stroke, ring);
+
+            Vector2 offset = cursor - pivot;
+            if (offset.sqrMagnitude > ringRadius * ringRadius)
+            {
+                Vector2 lineStart = pivot + offset.normalized * ringRadius;
+                Handles.DrawAAPolyLine(stroke,
+                    new Vector3(lineStart.x, lineStart.y, 0f),
+                    new Vector3(cursor.x, cursor.y, 0f));
+            }
+            Handles.DrawSolidDisc(new Vector3(cursor.x, cursor.y, 0f), Vector3.forward, 3.5f);
+            Handles.color = oldColor;
+        }
         // Cursor tether for the regular Blender-style rotation only.
         // Use GUI-space coordinates so the line stays attached to the cursor.
         if (mode == Mode.Rotate && target && Event.current.type == EventType.Repaint)
@@ -1141,16 +1422,21 @@ public static class BlenderTransformTool
                 cursor = pivot + new Vector2(Mathf.Cos(snappedGuiAngle),
                                               Mathf.Sin(snappedGuiAngle)) * radius;
             }
+            // Shift only controls visibility. Never reset or re-anchor the arc.
+            // The angle continues accumulating while the arc is hidden.
             Color oldGuiColor = Handles.color;
             Color guideColor = RotationGuideColor(ctrlHeld);
             Handles.color = guideColor;
             if (ctrlHeld)
             {
-                const float dialInnerRadius = 43f;
-                const float dialOuterRadius = 59f;
+                const float dialInnerRadius = 46f;
+                const float dialOuterRadius = 55f;
                 float step = Mathf.Max(0.0001f, RotateSnap);
                 int tickCount = Mathf.Min(180, Mathf.CeilToInt(360f / step));
-                Handles.color = new Color(guideColor.r, guideColor.g, guideColor.b, 0.40f);
+                // Axis snapping: only the dial ticks become white. The tether,
+                // pivot dots and other axis guides retain their RGB colors.
+                Color dialColor = constrained ? Color.white : guideColor;
+                Handles.color = new Color(dialColor.r, dialColor.g, dialColor.b, 0.40f);
                 for (int i = 0; i < tickCount; i++)
                 {
                     float degrees = i * step;
@@ -1161,7 +1447,7 @@ public static class BlenderTransformTool
                         worldPivot + direction * (dialInnerRadius * worldPerPixel));
                     Vector2 outer = HandleUtility.WorldToGUIPoint(
                         worldPivot + direction * (dialOuterRadius * worldPerPixel));
-                    Handles.DrawAAPolyLine(3f,
+                    Handles.DrawAAPolyLine(4f,
                         new Vector3(inner.x, inner.y, 0f),
                         new Vector3(outer.x, outer.y, 0f));
                 }
@@ -1169,6 +1455,56 @@ public static class BlenderTransformTool
             }
             Handles.DrawAAPolyLine(3f, new Vector3(pivot.x, pivot.y, 0f),
                                       new Vector3(cursor.x, cursor.y, 0f));
+            // Rotation arc lies in the actual X/Y/Z rotation plane when constrained.
+            // Project each point individually so oblique camera angles are respected.
+            {
+                const float arcRadius = 29f;
+                // Alternate drawing and erasing each full revolution.
+                // 0..360 draws the arc; 360..720 erases it from its starting end.
+                // The accumulated rotationAngle is unchanged.
+                float visualAngle = rotationAngle;
+                float turns = Mathf.Abs(visualAngle) / 360f;
+                int fullTurns = Mathf.FloorToInt(turns);
+                float progress = (turns - fullTurns) * 360f;
+                bool erasing = (fullTurns % 2) == 1;
+                float startDegrees = erasing ? progress : 0f;
+                float endDegrees = erasing ? 360f : progress;
+                float visibleDegrees = endDegrees - startDegrees;
+                float directionSign = Mathf.Sign(visualAngle);
+                int segments = Mathf.Clamp(Mathf.CeilToInt(visibleDegrees / 5f), 2, 72);
+                Vector3[] arc = new Vector3[segments + 1];
+                if (constrained)
+                {
+                    for (int i = 0; i <= segments; i++)
+                    {
+                        float a = (startDegrees + visibleDegrees * i / segments) * Mathf.Deg2Rad * directionSign;
+                        Vector3 arcReference = reference;
+                        Vector3 arcSecondary = secondary;
+                        Vector3 direction = arcReference * Mathf.Cos(a) + arcSecondary * Mathf.Sin(a);
+                        Vector2 screen = HandleUtility.WorldToGUIPoint(
+                            worldPivot + direction * (arcRadius * worldPerPixel));
+                        arc[i] = new Vector3(screen.x, screen.y, 0f);
+                    }
+                }
+                else
+                {
+                    // Use the initial dial direction for the entire operation.
+                    // Shift only hides the arc; it does not change this anchor.
+                    float startAngle = freeArcZeroAngle;
+                    for (int i = 0; i <= segments; i++)
+                    {
+                        float a = startAngle - (startDegrees + visibleDegrees * i / segments) * Mathf.Deg2Rad * directionSign;
+                        arc[i] = new Vector3(pivot.x + Mathf.Cos(a) * arcRadius,
+                                             pivot.y + Mathf.Sin(a) * arcRadius, 0f);
+                    }
+                }
+                Handles.color = ctrlHeld ? guideColor :
+                    constrained ? guideColor : new Color(1f, 0.72f, 0.32f, 0.92f);
+                // In X/Y/Z snapping, the white dial ticks replace the arc.
+                if (visibleDegrees > 0.01f && !ctrlHeld)
+                    Handles.DrawAAPolyLine(3f, arc);
+                Handles.color = guideColor;
+            }
             // Small filled endpoint dots in the same orange / snap-green color.
             // Draw in GUI coordinates so their size stays constant while zooming.
             Handles.DrawSolidDisc(new Vector3(pivot.x, pivot.y, 0f), Vector3.forward, 3.5f);
@@ -1192,23 +1528,35 @@ public static class BlenderTransformTool
             fontSize = 12, normal = { textColor = new Color(0.92f, 0.94f, 0.97f) }
         };
         GUI.Label(new Rect(rect.x + 27, rect.y + 6, 186, 19), "Blender Mode", title);
-        // Selection count, refreshed every Scene view repaint.
+        // Primary selection count, with a quieter triangle count to its right.
         int selectedCount = Selection.gameObjects.Length;
-        GUIContent objectIcon = EditorGUIUtility.IconContent("GameObject Icon");
         string countText = selectedCount.ToString(CultureInfo.InvariantCulture);
+        string trisText = "Tris: " + SelectedTriangleCount().ToString("N0", CultureInfo.InvariantCulture);
+        GUIContent objectIcon = EditorGUIUtility.IconContent("GameObject Icon");
         GUIStyle countStyle = new GUIStyle(EditorStyles.boldLabel)
         {
             fontSize = 12,
             alignment = TextAnchor.MiddleRight
         };
         countStyle.normal.textColor = new Color(0.84f, 0.88f, 0.94f);
-        // Measure the number itself, keeping the right edge fixed and moving
-        // only the cube icon left as the digit count increases.
+        GUIStyle trisStyle = new GUIStyle(EditorStyles.label)
+        {
+            fontSize = 11,
+            alignment = TextAnchor.MiddleRight
+        };
+        trisStyle.normal.textColor = EditorGUIUtility.isProSkin
+            ? new Color(0.60f, 0.63f, 0.67f)
+            : new Color(0.43f, 0.45f, 0.48f);
+        const float rightPadding = 10f;
+        const float gap = 10f;
+        float trisWidth = Mathf.Max(43f, trisStyle.CalcSize(new GUIContent(trisText)).x + 2f);
+        float trisX = rect.xMax - rightPadding - trisWidth;
+        GUI.Label(new Rect(trisX, rect.y + 6, trisWidth, 19), trisText, trisStyle);
         float countWidth = Mathf.Max(17f, countStyle.CalcSize(new GUIContent(countText)).x + 3f);
+        float countX = trisX - gap - countWidth;
+        GUI.Label(new Rect(countX, rect.y + 6, countWidth, 19), countText, countStyle);
         if (objectIcon != null && objectIcon.image != null)
-            GUI.DrawTexture(new Rect(rect.xMax - countWidth - 27f, rect.y + 9, 15, 15), objectIcon.image, ScaleMode.ScaleToFit);
-        GUI.Label(new Rect(rect.xMax - countWidth - 10f, rect.y + 6, countWidth, 19),
-                  countText, countStyle);
+            GUI.DrawTexture(new Rect(countX - 17f, rect.y + 9, 15, 15), objectIcon.image, ScaleMode.ScaleToFit);
         if (mode != Mode.None)
         {
             string action = vertexSnapMode && mode == Mode.Move ? "VERTEX SNAP" : mode == Mode.Move ? "MOVE" : mode == Mode.Rotate ? "ROTATE" :
@@ -1219,7 +1567,7 @@ public static class BlenderTransformTool
             if (transformIcon != null && transformIcon.image != null)
             {
                 Color previousColor = GUI.color;
-                if (ctrlHeld) GUI.color = new Color(0.38f, 1f, 0.48f, 1f);
+                if (ctrlHeld) GUI.color = mode == Mode.Rotate ? Color.white : new Color(0.38f, 1f, 0.48f, 1f);
                 GUI.DrawTexture(new Rect(rect.x + 27, rect.y + 36, 16, 16),
                                 transformIcon.image, ScaleMode.ScaleToFit);
                 GUI.color = previousColor;
