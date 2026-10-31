@@ -229,6 +229,7 @@ public static class CuttlefishAddMenu
                 AddComponentObject<ParticleSystem>("Particle System");
                 AddComponentObject<TrailRenderer>("Trail Renderer");
                 AddComponentObject<LineRenderer>("Line Renderer");
+                AddDecalProjector();
             }
             else if (page == "ui")
             {
@@ -247,6 +248,11 @@ public static class CuttlefishAddMenu
                 AddUnityMenu("Button - TextMeshPro", "GameObject/UI/Button - TextMeshPro");
                 AddUnityMenu("Dropdown - TextMeshPro", "GameObject/UI/Dropdown - TextMeshPro");
                 AddUnityMenu("Input Field - TextMeshPro", "GameObject/UI/Input Field - TextMeshPro");
+                entries.Add(Entry.CreateDivider());
+                AddUnityMenu("Text", "GameObject/UI/Legacy/Text");
+                AddUnityMenu("Button", "GameObject/UI/Legacy/Button");
+                AddUnityMenu("Dropdown", "GameObject/UI/Legacy/Dropdown");
+                AddUnityMenu("Input Field", "GameObject/UI/Legacy/Input Field");
             }
             else if (page == "prefabs" || page.StartsWith("prefabs/", StringComparison.Ordinal))
             {
@@ -361,6 +367,30 @@ public static class CuttlefishAddMenu
                 go.transform.position = position;
                 go.AddComponent<T>();
                 Register(go, "Add " + name);
+            }));
+        }
+
+        private void AddDecalProjector()
+        {
+            entries.Add(new Entry("Decal Projector", "GameObject Icon", () =>
+            {
+                // URP/HDRP provide DecalProjector in their own assemblies.
+                // Resolve it at runtime so this editor script also compiles in Built-in RP.
+                Type decalType = Type.GetType(
+                    "UnityEngine.Rendering.Universal.DecalProjector, Unity.RenderPipelines.Universal.Runtime");
+                if (decalType == null)
+                    decalType = Type.GetType(
+                        "UnityEngine.Rendering.HighDefinition.DecalProjector, Unity.RenderPipelines.HighDefinition.Runtime");
+                if (decalType == null)
+                {
+                    Debug.LogWarning("Cuttlefish Add Menu: Decal Projector requires URP or HDRP with decals supported.");
+                    return;
+                }
+
+                GameObject go = new GameObject("Decal Projector");
+                go.transform.SetPositionAndRotation(position, rotation);
+                go.AddComponent(decalType);
+                Register(go, "Add Decal Projector");
             }));
         }
 
@@ -803,7 +833,27 @@ public static class CuttlefishAddMenu
 
         private static bool DrawCustomPrimitiveIcon(string label, string iconType, Rect rect)
         {
-            string iconName = label == "Empty" ? "empty" :
+            // Match dedicated TMP/Legacy icons first; other UI entries use UI.png.
+            string uiIcon = null;
+            if (iconType == "Canvas Icon")
+            {
+                bool tmp = label.EndsWith(" - TextMeshPro", StringComparison.Ordinal);
+                bool legacy = label == "Text" || label == "Button" || label == "Dropdown" || label == "Input Field";
+                if (tmp || legacy)
+                {
+                    if (label == "Text" || label.StartsWith("Text - ", StringComparison.Ordinal)) uiIcon = "text";
+                    else if (label == "Button" || label.StartsWith("Button - ", StringComparison.Ordinal)) uiIcon = "button";
+                    else if (label == "Dropdown" || label.StartsWith("Dropdown - ", StringComparison.Ordinal)) uiIcon = "dropdown";
+                    else if (label == "Input Field" || label.StartsWith("Input Field - ", StringComparison.Ordinal)) uiIcon = "input";
+                    if (tmp && uiIcon != null) uiIcon += "_TMP";
+                }
+                if (label == "Toggle") uiIcon = "toggle";
+                else if (label == "Slider") uiIcon = "slider";
+                if (uiIcon == null) uiIcon = "UI";
+            }
+            string iconName = uiIcon != null ? uiIcon :
+                              label == "UI" || label == "UI Canvas" ? "UI" :
+                              label == "Empty" ? "empty" :
                               label == "Cone" ? "triangle" :
                               label == "Cube" ? "square" :
                               label == "Icosphere" ? "circle" :
@@ -819,7 +869,7 @@ public static class CuttlefishAddMenu
                               label == "Directional Light" || label == "Light" || label == "Lights" ? "sun" :
                               label == "Spot Light" ? "spot-light" :
                               label == "Point Light" ? "point-light" :
-                              label == "Particle System" || label == "Effects" ? "particles" :
+                              label == "Particle System" || label == "Effects" || label == "Decal Projector" ? "particles" :
                               label == "Trail Renderer" ? "trail" :
                               label == "Line Renderer" ? "line" :
                               label == "Camera" ? "camera" :
