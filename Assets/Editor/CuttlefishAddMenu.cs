@@ -17,12 +17,25 @@ public static class CuttlefishAddMenu
 
     static CuttlefishAddMenu() { SceneView.duringSceneGui += OnSceneGUI; }
 
+    // Public bridge for the Spatial Tools menu (the popup itself is a nested class).
+    public static void CloseForOtherMenu()
+    {
+        AddPopup.CloseForOtherMenu();
+    }
+
+    // Lets the Space Menu avoid refocusing the Scene View over an open Add popup.
+    public static bool IsOpen { get { return AddPopup.IsOpen; } }
+
     // Diagnostic fallback: use this menu command to verify the new script loaded.
     [MenuItem("Tools/Cuttlefish Add Menu #a")]
     private static void OpenFromTools()
     {
         SceneView scene = SceneView.lastActiveSceneView;
         if (scene == null) return;
+        if (AddPopup.IsOpen) return;
+        // Close the Space popup WITHOUT its delayed Scene View refocus.
+        // This shortcut also fires while the Space popup has keyboard focus.
+        CuttlefishSceneActionMenu.CloseForOtherMenu();
         Vector3 position = scene.pivot;
         Quaternion rotation = scene.rotation;
         EditorApplication.delayCall += () =>
@@ -37,11 +50,15 @@ public static class CuttlefishAddMenu
         if (e.type == EventType.MouseUp && e.button == 1) rightHeld = false;
         if (!EditorPrefs.GetBool(EnabledKey, false) || rightHeld || GUIUtility.hotControl != 0) return;
         if (e.type != EventType.KeyDown || e.keyCode != KeyCode.A || !e.shift || e.alt || e.control || e.command) return;
+        // Consume repeated Shift+A without closing, replacing, or refocusing the popup.
+        if (AddPopup.IsOpen) { e.Use(); return; }
         // Capture the cursor's screen position NOW, while Scene GUI coordinates are valid.
         Vector2 cursorScreen = GUIUtility.GUIToScreenPoint(e.mousePosition);
         Vector3 position = view.pivot;
         Quaternion rotation = view.rotation;
         e.Use();
+        // Keep the incoming Add popup from being dismissed by Space's focus cleanup.
+        CuttlefishSceneActionMenu.CloseForOtherMenu();
         Vector2 popupScreen = FindOpeningPoint(view, cursorScreen);
         EditorApplication.delayCall += () =>
             AddPopup.ShowAt(popupScreen, position, rotation);
@@ -130,10 +147,20 @@ public static class CuttlefishAddMenu
             }
         }
         private void CancelPendingHover() { pendingHoverIndex = -1; }
-        private static AddPopup active;
-        public static void ShowAt(Vector2 screenPoint, Vector3 spawnPosition, Quaternion spawnRotation)
+        // Close Add and its secondary window before opening Spatial Tools.
+        public static void CloseForOtherMenu()
         {
             if (active != null) active.Close();
+        }
+        private static AddPopup active;
+        private static bool openingPending;
+        public static bool IsOpen { get { return openingPending || (active != null && !active.closing); } }
+        public static void ShowAt(Vector2 screenPoint, Vector3 spawnPosition, Quaternion spawnRotation)
+        {
+            if (active != null && !active.closing) return;
+            // Also cover Add opening from an external toolbar or delayed menu command.
+            CuttlefishSceneActionMenu.CloseForOtherMenu();
+            openingPending = true;
             AddPopup window = CreateInstance<AddPopup>();
             window.position = new Rect(screenPoint.x, screenPoint.y, ColumnWidth, RootHeight);
             window.spawnPosition = spawnPosition;
@@ -143,6 +170,7 @@ public static class CuttlefishAddMenu
             window.OnOpen();
             EditorApplication.update += window.OnEditorUpdate;
             active = window;
+            openingPending = false;
         }
         private static void DrawWindowBorder(Rect r)
         {
@@ -155,7 +183,7 @@ public static class CuttlefishAddMenu
         private Vector3 spawnPosition;
         private Quaternion spawnRotation;
         private const float RootHeight = 244f;
-        private void OnGUI() { var r = new Rect(0f, 0f, position.width, position.height); DrawRoot(r); DrawWindowBorder(r); }
+        private void OnGUI() { if (IgnoreSpaceShortcut()) return; var r = new Rect(0f, 0f, position.width, position.height); DrawRoot(r); DrawWindowBorder(r); }
         private void OnDisable()
         {
             closing = true;
@@ -171,11 +199,23 @@ public static class CuttlefishAddMenu
                 if (focusedWindow != this && focusedWindow != secondary) Close();
             };
         }
+        // Keep the Add Menu open when Space is pressed. Do not invoke the Action Menu.
+        // Allow ordinary spaces when typing into the Add Menu search field.
+        private static bool IgnoreSpaceShortcut()
+        {
+            Event e = Event.current;
+            if (e == null || e.type != EventType.KeyDown || e.keyCode != KeyCode.Space ||
+                e.shift || e.alt || e.control || e.command || EditorGUIUtility.editingTextField)
+                return false;
+            e.Use();
+            return true;
+        }
+
         private void CloseAll() { Close(); }
         private sealed class SecondaryWindow : EditorWindow
         {
             internal AddPopup owner;
-            private void OnGUI() { if (owner != null) { var r = new Rect(0,0,position.width,position.height); owner.DrawSecondary(r); DrawWindowBorder(r); } }
+            private void OnGUI() { if (owner != null) { if (IgnoreSpaceShortcut()) return; var r = new Rect(0,0,position.width,position.height); owner.DrawSecondary(r); DrawWindowBorder(r); } }
             private void OnLostFocus()
             {
                 EditorApplication.delayCall += () =>
@@ -597,8 +637,6 @@ public static class CuttlefishAddMenu
 
             Event e = Event.current;
             bool searchFocused = GUI.GetNameOfFocusedControl() == "CuttlefishAddSearch";
-            if (e.type == EventType.KeyDown && e.keyCode == KeyCode.Escape)
-            { CloseAll(); e.Use(); return; }
 
             EditorGUI.DrawRect(rect, new Color(.105f, .108f, .12f));
             DrawNineSlice(rect, roundedMenu, 6f);
@@ -639,8 +677,6 @@ public static class CuttlefishAddMenu
             if (rowStyle == null || !ShowingRight || (ShowingResults && SearchMatches().Count == 0)) return;
             EditorGUI.DrawRect(rect, new Color(.105f, .108f, .12f));
             DrawNineSlice(rect, roundedMenu, 6f);
-            if (Event.current.type == EventType.KeyDown && Event.current.keyCode == KeyCode.Escape)
-            { CloseAll(); Event.current.Use(); return; }
                 if (Event.current.type == EventType.MouseLeaveWindow) CancelPendingFolder();
                 List<Entry> items = ShowingResults ? SearchMatches() : GetEntries(openPage);
                 float contentHeight = ContentHeight(items, false);

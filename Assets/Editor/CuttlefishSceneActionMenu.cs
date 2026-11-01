@@ -16,37 +16,81 @@ public static class CuttlefishSceneActionMenu
     private static readonly Color Amber = new Color(.87f, .72f, .49f);
     private static ActionPopup openPopup;
 
+    // Match the actual row layout exactly. A 160-point native window around
+    // 147 points of content exposed Unity's grey background below the menu.
+    private const float PopupWidth = 192f;
+    private const float PopupHeight = 147f;
+
+    // The Unity _SPACE menu accelerator can run before SceneGUI receives KeyDown.
+    // Cache the cursor while SceneGUI coordinates are valid so BOTH shortcut
+    // paths open at the cursor instead of one jumping to Scene View center.
+    private static SceneView cursorScene;
+    private static Vector2 cursorPopupPosition;
+    private static bool hasSceneCursor;
+
     static CuttlefishSceneActionMenu() { SceneView.duringSceneGui += SceneGUI; }
 
     private static void SceneGUI(SceneView view)
     {
         Event e = Event.current;
-        if (e == null || e.type != EventType.KeyDown || e.keyCode != KeyCode.Space ||
+        if (e == null) return;
+
+        // Keep the latest cursor anchor. In particular, Unity may dispatch
+        // the _SPACE MenuItem before it dispatches this window's KeyDown.
+        if (e.type == EventType.MouseMove || e.type == EventType.MouseDrag ||
+            e.type == EventType.MouseDown || e.type == EventType.MouseUp ||
+            (e.type == EventType.Repaint && EditorWindow.mouseOverWindow == view) ||
+            (e.type == EventType.KeyDown && e.keyCode == KeyCode.Space))
+        {
+            Rect sceneArea = new Rect(0f, 0f, view.position.width, view.position.height);
+            if (sceneArea.Contains(e.mousePosition))
+            {
+                cursorScene = view;
+                cursorPopupPosition = FindSpaceOpeningPoint(view,
+                    GUIUtility.GUIToScreenPoint(e.mousePosition));
+                hasSceneCursor = true;
+            }
+        }
+
+        if (e.type != EventType.KeyDown || e.keyCode != KeyCode.Space ||
             e.alt || e.shift || e.control || e.command || EditorGUIUtility.editingTextField ||
             GUIUtility.hotControl != 0) return;
-        // Match Shift+A: capture the cursor in screen coordinates while Scene GUI is active.
-        Vector2 cursorScreen = GUIUtility.GUIToScreenPoint(e.mousePosition);
-        Vector2 popupScreen = FindSpaceOpeningPoint(view, cursorScreen);
-        // PopupWindow.Show converts a GUI anchor to screen space itself. Convert back
-        // while the Scene GUI context is valid, and show BEFORE leaving this event.
-        Vector2 popupGUI = GUIUtility.ScreenToGUIPoint(popupScreen);
+        Vector2 point = FindSpaceOpeningPoint(view, GUIUtility.GUIToScreenPoint(e.mousePosition));
+        cursorScene = view;
+        cursorPopupPosition = point;
+        hasSceneCursor = true;
         e.Use();
-        if (openPopup != null) { ClosePopup(); return; }
-        PopupWindow.Show(new Rect(popupGUI.x, popupGUI.y, 1f, 1f), new ActionPopup(view));
+        // Repeated Space presses are ignored while the Action Menu is open.
+        if (openPopup != null) return;
+        ShowPopupAt(point, view);
+    }
+
+    private static void ShowPopupAt(Vector2 screenPoint, SceneView view)
+    {
+        if (view == null || openPopup != null) return;
+        ActionPopup popup = ScriptableObject.CreateInstance<ActionPopup>();
+        popup.Initialize(view);
+        // EditorWindow.position uses screen coordinates. Anchor the popup's
+        // top-left corner directly at the mouse position, like Shift+A.
+        popup.position = new Rect(screenPoint.x, screenPoint.y, PopupWidth, PopupHeight);
+        openPopup = popup;
+        popup.ShowPopup();
+        popup.Focus();
     }
 
     // Same Scene View screen-space bounds logic as the working Shift+A menu.
     // The Space popup has only one column, so no secondary-column reservation.
     private static Vector2 FindSpaceOpeningPoint(SceneView view, Vector2 cursorScreen)
     {
-        const float popupWidth = 192f;
-        const float popupHeight = 160f;
+        const float popupWidth = PopupWidth;
+        const float popupHeight = PopupHeight;
         const float edgeMargin = 8f;
         Vector2 sceneOrigin = GUIUtility.GUIToScreenPoint(Vector2.zero);
         Rect bounds = new Rect(sceneOrigin.x, sceneOrigin.y,
                                view.position.width, view.position.height);
-        // Preserve the user's preferred keyboard-only cursor offset.
-        Vector2 point = cursorScreen + new Vector2(0f, 0f);
+        // Identical anchor rule to Add: cursor touches popup's upper-left.
+        // Only shift the position when needed to keep the window on-screen.
+        Vector2 point = cursorScreen;
         point.x = Mathf.Clamp(point.x, bounds.xMin + edgeMargin,
             Mathf.Max(bounds.xMin + edgeMargin, bounds.xMax - popupWidth - edgeMargin));
         point.y = Mathf.Clamp(point.y, bounds.yMin + edgeMargin,
@@ -54,52 +98,62 @@ public static class CuttlefishSceneActionMenu
         return point;
     }
 
-    // Toolbar-only entry: call during SceneView OnGUI, while the GUI coordinates are valid.
-    // PopupWindow.Show expects a GUI-space anchor and handles conversion itself.
+    // Toolbar supplies a Scene GUI-space anchor.
     public static void ShowAtToolbarGUI(Rect guiAnchor, SceneView view)
     {
-        if (view == null) return;
-        if (openPopup != null) { ClosePopup(); return; }
-        PopupWindow.Show(guiAnchor, new ActionPopup(view));
+        ShowPopupAt(GUIUtility.GUIToScreenPoint(guiAnchor.position), view);
     }
 
-    // Called only by the Cuttlefish toolbar. Screen-space anchor matches + Add.
-    // Spacebar's cursor-position behavior remains unchanged.
     public static void ShowAtScreen(Vector2 screenPoint, SceneView view)
     {
-        if (view == null) return;
-        if (openPopup != null) { ClosePopup(); return; }
-        PopupWindow.Show(new Rect(screenPoint.x, screenPoint.y, 1f, 1f),
-                         new ActionPopup(view));
+        ShowPopupAt(screenPoint, view);
     }
 
+    // Restore the Unity menu accelerator as a fallback for Space keyboard input.
     [MenuItem("Tools/Cuttlefish Action Menu _SPACE")]
     private static void OpenFromTools()
     {
-        if (openPopup != null) { ClosePopup(); return; }
         SceneView view = SceneView.lastActiveSceneView;
-        if (view == null) return;
-        // Menu command has no mouse event; use Scene View center as fallback only.
-        Rect r = view.position;
-        Rect anchor = new Rect(r.center.x, r.center.y, 1, 1);
+        if (view == null || openPopup != null) return;
+        // This Unity accelerator may fire instead of the SceneGUI shortcut.
+        // Reuse the last SceneGUI cursor position rather than the old center
+        // fallback (which was also in dock-relative, not screen, coordinates).
+        Vector2 point = hasSceneCursor && cursorScene == view
+            ? cursorPopupPosition
+            : view.position.center;
+        ShowPopupAt(point, view);
+    }
+
+    // Incrementing this also cancels any already-queued focus restoration.
+    private static int focusRequestVersion;
+
+    // A different popup is taking over: close Space but NEVER refocus the Scene View.
+    public static void CloseForOtherMenu() { ClosePopup(false); }
+
+    private static void ClosePopup(bool restoreSceneFocus = true)
+    {
+        int request = ++focusRequestVersion;
+        ActionPopup popup = openPopup;
+        if (popup == null) return;
+        openPopup = null;
+        SceneView view = popup.Scene;
+        popup.Close();
+        if (!restoreSceneFocus) return;
+
+        // Normal Space/Escape closes still return focus to the Scene View.
+        // However, if Add has opened in the meantime, do not steal its focus.
         EditorApplication.delayCall += () =>
         {
-            if (view != null) PopupWindow.Show(anchor, new ActionPopup(view));
+            if (request == focusRequestVersion && openPopup == null &&
+                !CuttlefishAddMenu.IsOpen && view != null)
+                view.Focus();
         };
     }
 
-    private static void ClosePopup()
+    private sealed class ActionPopup : EditorWindow
     {
-        ActionPopup popup = openPopup;
-        openPopup = null;
-        if (popup == null || popup.editorWindow == null) return;
-        EditorWindow window = popup.editorWindow;
-        EditorApplication.delayCall += () => { if (window != null) window.Close(); };
-    }
-
-    private sealed class ActionPopup : PopupWindowContent
-    {
-        private readonly SceneView view;
+        private SceneView view;
+        internal SceneView Scene { get { return view; } }
         private GUIStyle textStyle;
         private Texture2D bg, highlight, selected;
         private bool pending;
@@ -107,11 +161,8 @@ public static class CuttlefishSceneActionMenu
         private const float Row = 23f;
         private const float Gap = 3f;
         private const float Pad = 6f;
-        // 2 rows + separator + 2 rows + separator + 1 row, with exact padding.
-        private const float Height = 6f + 23f + 3f + 23f + 7f + 23f + 3f + 23f + 7f + 23f + 6f;
-        public ActionPopup(SceneView sceneView) { view = sceneView; openPopup = this; }
-        public override Vector2 GetWindowSize() { return new Vector2(Width, Height); }
-        public override void OnClose()
+        internal void Initialize(SceneView sceneView) { view = sceneView; }
+        private void OnDisable()
         {
             if (openPopup == this) openPopup = null;
             Texture2D a = bg, b = highlight, c = selected;
@@ -123,6 +174,14 @@ public static class CuttlefishSceneActionMenu
                 if (c != null) Object.DestroyImmediate(c);
             };
         }
+        private void OnLostFocus()
+        {
+            EditorApplication.delayCall += () =>
+            {
+                if (this != null && openPopup == this && EditorWindow.focusedWindow != this)
+                    ClosePopup();
+            };
+        }
         private void Init()
         {
             if (textStyle != null) return;
@@ -132,17 +191,29 @@ public static class CuttlefishSceneActionMenu
             highlight = MakeRounded(Hover, 4);
             selected = MakeRounded(Active, 4);
         }
-        public override void OnGUI(Rect rect)
+        private void OnGUI()
         {
             Init();
             Event e = Event.current;
-            if (e.type == EventType.KeyDown && (e.keyCode == KeyCode.Escape || (e.keyCode == KeyCode.Space && !e.shift && !e.alt && !e.control && !e.command)))
+            // Space is reserved for this menu while it is open; do not toggle it.
+            if (e.type == EventType.KeyDown && e.keyCode == KeyCode.Space &&
+                !e.shift && !e.alt && !e.control && !e.command)
+            {
+                e.Use();
+                return;
+            }
+            if (e.type == EventType.KeyDown && e.keyCode == KeyCode.Escape)
             {
                 e.Use();
                 ClosePopup();
                 return;
             }
-            DrawNineSlice(new Rect(0, 0, Width, Height), bg, 6);
+            // Same three-layer treatment as Shift+A: opaque background,
+            // rounded surface, then a 1-point neutral border on all edges.
+            Rect windowRect = new Rect(0f, 0f, position.width, position.height);
+            EditorGUI.DrawRect(windowRect, Background);
+            DrawNineSlice(windowRect, bg, 6f);
+            DrawWindowBorder(windowRect);
             float y = Pad;
             DrawPair(0, 1, y); y += Row + Gap;
             DrawPair(2, 3, y); y += Row + 4;
@@ -152,6 +223,16 @@ public static class CuttlefishSceneActionMenu
             Divider(y); y += 3;
             DrawFull(6, y);
         }
+        // Same pixel and color values as CuttlefishAddMenu.DrawWindowBorder.
+        private static void DrawWindowBorder(Rect r)
+        {
+            Color edge = new Color(.39f, .40f, .42f, 1f);
+            EditorGUI.DrawRect(new Rect(0f, 0f, r.width, 1f), edge);
+            EditorGUI.DrawRect(new Rect(0f, r.height - 1f, r.width, 1f), edge);
+            EditorGUI.DrawRect(new Rect(0f, 0f, 1f, r.height), edge);
+            EditorGUI.DrawRect(new Rect(r.width - 1f, 0f, 1f, r.height), edge);
+        }
+
         private void Divider(float y)
         {
             EditorGUI.DrawRect(new Rect(Pad + 2, y, Width - 2 * Pad - 4, 1), new Color(.30f, .30f, .32f, .85f));
@@ -197,7 +278,7 @@ public static class CuttlefishSceneActionMenu
                 {
                     Perform(action, view);
                     pending = false;
-                    if (editorWindow != null) editorWindow.Repaint();
+                    if (this != null) Repaint();
                 };
                 e.Use();
             }
