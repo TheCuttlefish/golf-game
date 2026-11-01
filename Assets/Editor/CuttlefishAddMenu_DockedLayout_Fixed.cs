@@ -11,8 +11,8 @@ public static class CuttlefishAddMenu
 {
     // Shared preference key used by Cuttlefish Mode (retain for compatibility).
     private const string EnabledKey = "BlenderTransformTool.Enabled";
-    // Existing prefab directory retained so saved prefabs remain discoverable.
-    private const string PrefabFolder = "Assets/Prefabs";
+    // Search all project Assets for prefabs, regardless of folder structure.
+    private const string PrefabFolder = "Assets";
     private static bool rightHeld;
 
     static CuttlefishAddMenu() { SceneView.duringSceneGui += OnSceneGUI; }
@@ -26,7 +26,7 @@ public static class CuttlefishAddMenu
         Vector3 position = scene.pivot;
         Quaternion rotation = scene.rotation;
         EditorApplication.delayCall += () =>
-            PopupWindow.Show(new Rect(120, 100, 1, 1), new AddPopup(position, rotation));
+            AddPopup.ShowAt(new Vector2(120f, 100f), position, rotation);
     }
 
     private static void OnSceneGUI(SceneView view)
@@ -37,39 +37,43 @@ public static class CuttlefishAddMenu
         if (e.type == EventType.MouseUp && e.button == 1) rightHeld = false;
         if (!EditorPrefs.GetBool(EnabledKey, false) || rightHeld || GUIUtility.hotControl != 0) return;
         if (e.type != EventType.KeyDown || e.keyCode != KeyCode.A || !e.shift || e.alt || e.control || e.command) return;
-        Vector2 at = e.mousePosition;
+        // Capture the cursor's screen position NOW, while Scene GUI coordinates are valid.
+        Vector2 cursorScreen = GUIUtility.GUIToScreenPoint(e.mousePosition);
         Vector3 position = view.pivot;
         Quaternion rotation = view.rotation;
         e.Use();
-        Rect anchor = FindOpeningRect(view, at);
+        Vector2 popupScreen = FindOpeningPoint(view, cursorScreen);
         EditorApplication.delayCall += () =>
-            PopupWindow.Show(anchor, new AddPopup(position, rotation));
+            AddPopup.ShowAt(popupScreen, position, rotation);
     }
 
-    // Position the *compact* popup with room for its eventual second column.
-    // The menu itself still expands/collapses exactly as before.
-    private static Rect FindOpeningRect(SceneView view, Vector2 mouseGUI)
+    // Prefer the cursor touching the popup's upper-left corner. Only reposition
+    // when the compact main popup would run outside the Scene View.
+    private static Vector2 FindOpeningPoint(SceneView view, Vector2 cursorScreen)
     {
-        const float expandedWidth = 408f; // 2 * AddPopup.ColumnWidth
-        const float expandedHeight = 440f; // room for the longest normal submenu
-        const float margin = 8f;
-
-        Vector2 screen = GUIUtility.GUIToScreenPoint(mouseGUI);
-        Rect bounds = view.position; // editor window bounds in screen coordinates
-        float left = bounds.xMin + margin;
-        float right = Mathf.Max(left, bounds.xMax - expandedWidth - margin);
-        float top = bounds.yMin + margin;
-        float bottom = Mathf.Max(top, bounds.yMax - expandedHeight - margin);
-        screen.x = Mathf.Clamp(screen.x, left, right);
-        screen.y = Mathf.Clamp(screen.y, top, bottom);
-        Vector2 gui = GUIUtility.ScreenToGUIPoint(screen);
-        return new Rect(gui.x, gui.y, 1f, 1f);
+        const float popupWidth = 204f;
+        const float popupHeight = 244f;
+        // view.position is dock-layout-relative, NOT a screen-space rectangle.
+        // Convert the Scene GUI origin to screen space before clamping.
+        Vector2 sceneOrigin = GUIUtility.GUIToScreenPoint(Vector2.zero);
+        Rect bounds = new Rect(sceneOrigin.x, sceneOrigin.y,
+                               view.position.width, view.position.height);
+        const float secondaryWidth = 204f;
+        const float edgeMargin = 8f;
+        float reservedWidth = popupWidth + secondaryWidth;
+        float availableWidth = bounds.width - edgeMargin * 2f;
+        // Keep the secondary column to the right whenever there is room.
+        float desiredWidth = availableWidth >= reservedWidth ? reservedWidth : popupWidth;
+        cursorScreen.x = Mathf.Clamp(cursorScreen.x, bounds.xMin + edgeMargin,
+            Mathf.Max(bounds.xMin + edgeMargin, bounds.xMax - desiredWidth - edgeMargin));
+        cursorScreen.y = Mathf.Clamp(cursorScreen.y, bounds.yMin + edgeMargin,
+            Mathf.Max(bounds.yMin + edgeMargin, bounds.yMax - popupHeight - edgeMargin));
+        return cursorScreen;
     }
 
-    private sealed class AddPopup : PopupWindowContent
+    private sealed class AddPopup : EditorWindow
     {
-        private readonly Vector3 position;
-        private readonly Quaternion rotation;
+        
         private readonly List<Entry> entries = new List<Entry>();
         private string page = "";
         private readonly Stack<string> pageHistory = new Stack<string>();
@@ -90,12 +94,146 @@ public static class CuttlefishAddMenu
             public static Entry CreateDivider() { return new Entry("", "") { separator = true }; }
         }
 
-        public AddPopup(Vector3 position, Quaternion rotation)
-        { this.position = position; this.rotation = rotation; }
+        private SecondaryWindow secondary;
+        private bool closing;
+        private int pendingHoverIndex = -1;
+        private string pendingHoverPage = "";
+        private double pendingHoverSince;
+        private const double HoverDelay = 0.18;
+        private bool refocusSearch;
+        private string pendingFolderPage;
+        private double pendingFolderSince;
+        private void CancelPendingFolder() { pendingFolderPage = null; }
+        private void OnEditorUpdate()
+        {
+            if (closing || this == null) return;
+            if (pendingFolderPage != null && !ShowingResults &&
+                EditorApplication.timeSinceStartup - pendingFolderSince >= HoverDelay)
+            {
+                string folderDestination = pendingFolderPage;
+                pendingFolderPage = null;
+                if (openPage != folderDestination && folderDestination.StartsWith("prefabs/", StringComparison.Ordinal))
+                    OpenSubmenu(folderDestination);
+            }
+            if (pendingHoverIndex < 0 || ShowingResults) return;
+            if (EditorApplication.timeSinceStartup - pendingHoverSince < HoverDelay) return;
+            int index = pendingHoverIndex;
+            string destination = pendingHoverPage;
+            pendingHoverIndex = -1;
+            if (rootIndex != index || openPage != destination)
+            {
+                rootIndex = index;
+                openPage = destination;
+                selectedIndex = 0;
+                pageHistory.Clear();
+                ResizeToContents();
+            }
+        }
+        private void CancelPendingHover() { pendingHoverIndex = -1; }
+        private static AddPopup active;
+        public static void ShowAt(Vector2 screenPoint, Vector3 spawnPosition, Quaternion spawnRotation)
+        {
+            if (active != null) active.Close();
+            AddPopup window = CreateInstance<AddPopup>();
+            window.position = new Rect(screenPoint.x, screenPoint.y, ColumnWidth, RootHeight);
+            window.spawnPosition = spawnPosition;
+            window.spawnRotation = spawnRotation;
+            window.ShowPopup();
+            window.wantsMouseMove = true;
+            window.OnOpen();
+            EditorApplication.update += window.OnEditorUpdate;
+            active = window;
+        }
+        private static void DrawWindowBorder(Rect r)
+        {
+            Color edge = new Color(.39f, .40f, .42f, 1f);
+            EditorGUI.DrawRect(new Rect(0f, 0f, r.width, 1f), edge);
+            EditorGUI.DrawRect(new Rect(0f, r.height - 1f, r.width, 1f), edge);
+            EditorGUI.DrawRect(new Rect(0f, 0f, 1f, r.height), edge);
+            EditorGUI.DrawRect(new Rect(r.width - 1f, 0f, 1f, r.height), edge);
+        }
+        private Vector3 spawnPosition;
+        private Quaternion spawnRotation;
+        private const float RootHeight = 244f;
+        private void OnGUI() { var r = new Rect(0f, 0f, position.width, position.height); DrawRoot(r); DrawWindowBorder(r); }
+        private void OnDisable()
+        {
+            closing = true;
+            EditorApplication.update -= OnEditorUpdate;
+            if (secondary != null) { SecondaryWindow old = secondary; secondary = null; old.Close(); }
+            if (active == this) active = null;
+        }
+        private void OnLostFocus()
+        {
+            EditorApplication.delayCall += () =>
+            {
+                if (this == null || closing) return;
+                if (focusedWindow != this && focusedWindow != secondary) Close();
+            };
+        }
+        private void CloseAll() { Close(); }
+        private sealed class SecondaryWindow : EditorWindow
+        {
+            internal AddPopup owner;
+            private void OnGUI() { if (owner != null) { var r = new Rect(0,0,position.width,position.height); owner.DrawSecondary(r); DrawWindowBorder(r); } }
+            private void OnLostFocus()
+            {
+                EditorApplication.delayCall += () =>
+                {
+                    if (this == null || owner == null) return;
+                    if (focusedWindow != this && focusedWindow != owner) owner.Close();
+                };
+            }
+            private void OnDisable()
+            {
+                if (owner != null && owner.secondary == this) owner.secondary = null;
+            }
+        }
+        private void SyncSecondary()
+        {
+            if (!ShowingRight || (ShowingResults && SearchMatches().Count == 0))
+            {
+                if (secondary != null)
+                {
+                    var old = secondary;
+                    secondary = null;
+                    old.Close();
+                }
+                return;
+            }
+            List<Entry> items = ShowingResults ? SearchMatches() : GetEntries(openPage);
+            float height = Mathf.Min(MaxMenuHeight, ContentHeight(items, false) + 8f);
+            Rect target = new Rect(position.xMax, position.y, ColumnWidth, height);
+            if (secondary == null)
+            {
+                secondary = CreateInstance<SecondaryWindow>();
+                secondary.owner = this;
+                secondary.position = target;
+                secondary.ShowPopup();
+                // A newly opened secondary popup must not steal text input from Search.
+                if (ShowingResults)
+                {
+                    refocusSearch = true;
+                    EditorApplication.delayCall += () =>
+                    {
+                        if (this != null && !closing && ShowingResults)
+                        {
+                            Focus();
+                            EditorGUI.FocusTextInControl("CuttlefishAddSearch");
+                            Repaint();
+                        }
+                    };
+                }
+            }
+            else if (Mathf.Abs(secondary.position.height - height) > .5f || Mathf.Abs(secondary.position.x - target.x) > .5f)
+                secondary.position = target;
+            secondary.Repaint();
+        }
 
         private int selectedIndex;
         private int rootIndex = -1;
         private string openPage = "";
+        private const float MaxMenuHeight = 500f; // Tall categories stay within the opening-position allowance.
         private const float ColumnWidth = 204f;
         private const float RowHeight = 23f;
         private const float Pad = 6f;
@@ -124,17 +262,16 @@ public static class CuttlefishAddMenu
             return height;
         }
 
-        public override Vector2 GetWindowSize()
+        // Keep the native popup bounds completely stable. Changing PopupWindow
+        // dimensions while hovering causes Unity to reposition the whole menu.
+        // The left panel and individual right-panel backgrounds are still drawn
+        // at their own content heights below.
+        private Vector2 GetWindowSize()
         {
-            List<Entry> right = ShowingResults ? SearchMatches() :
-                openPage.Length > 0 ? GetEntries(openPage) : null;
-            float leftHeight = SearchHeight + ContentHeight(RootEntries());
-            float rightHeight = right == null ? 0f : Mathf.Min(ContentHeight(right, false), Pad * 2f + MaxRows * RowHeight);
-            return new Vector2(ColumnWidth * (ShowingRight ? 2 : 1),
-                Mathf.Max(leftHeight, rightHeight));
+            return new Vector2(ColumnWidth, RootHeight);
         }
 
-        public override void OnOpen()
+        private void OnOpen()
         {
             page = "";
             Build();
@@ -144,15 +281,10 @@ public static class CuttlefishAddMenu
 
         private void ResizeToContents()
         {
-            if (editorWindow == null) return;
-            Vector2 size = GetWindowSize();
-            Rect r = editorWindow.position;
-            r.width = size.x;
-            r.height = size.y;
-            editorWindow.minSize = size;
-            editorWindow.maxSize = size;
-            editorWindow.position = r;
-            editorWindow.Repaint();
+            // Never resize or reposition the popup on category changes.
+            // Repainting alone keeps its anchor fixed while hovering or clicking.
+            Repaint();
+            SyncSecondary();
         }
 
         private void Build()
@@ -179,7 +311,7 @@ public static class CuttlefishAddMenu
                 entries.Add(new Entry("Empty", "Empty Dot", () =>
                 {
                     GameObject go = new GameObject("GameObject");
-                    go.transform.position = position;
+                    PlaceLikeUnity(go);
                     Register(go, "Add Empty GameObject");
                 }));
                 entries.Add(Entry.CreateDivider());
@@ -207,14 +339,15 @@ public static class CuttlefishAddMenu
                 entries.Add(new Entry("Empty", "GameObject Icon", () =>
                 {
                     GameObject go = new GameObject("GameObject");
-                    go.transform.position = position;
+                    PlaceLikeUnity(go);
                     Register(go, "Add Empty GameObject");
                 }));
                 entries.Add(new Entry("Camera", "Camera Icon", () =>
                 {
                     GameObject go = new GameObject("Camera");
                     go.AddComponent<Camera>();
-                    go.transform.SetPositionAndRotation(position, rotation);
+                    go.transform.rotation = spawnRotation;
+                    PlaceLikeUnity(go);
                     Register(go, "Add Camera");
                 }));
             }
@@ -256,11 +389,6 @@ public static class CuttlefishAddMenu
             }
             else if (page == "prefabs" || page.StartsWith("prefabs/", StringComparison.Ordinal))
             {
-                if (!AssetDatabase.IsValidFolder(PrefabFolder))
-                {
-                    entries.Add(new Entry("No prefab folder found", "console.warnicon"));
-                    return;
-                }
                 string[] ids = AssetDatabase.FindAssets("t:Prefab", new[] { PrefabFolder });
                 List<string> paths = new List<string>();
                 foreach (string id in ids)
@@ -296,12 +424,32 @@ public static class CuttlefishAddMenu
             }
         }
 
+        // Use Unity's native Scene View placement when available instead of
+        // placing new objects at the Scene View orbit pivot (which may be distant).
+        private void PlaceLikeUnity(GameObject go)
+        {
+            if (!go) return;
+            var method = typeof(SceneView).GetMethod("PlaceGameObjectInFrontOfSceneView",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Static, null, new[] { typeof(GameObject) }, null);
+            if (method != null)
+            {
+                try { method.Invoke(null, new object[] { go }); return; }
+                catch (System.Exception) { /* Fall back for other Unity versions. */ }
+            }
+            SceneView view = SceneView.lastActiveSceneView;
+            if (view != null && view.camera != null)
+                go.transform.position = view.camera.transform.position + view.camera.transform.forward * 10f;
+            else
+                go.transform.position = spawnPosition;
+        }
+
         private void AddPrimitive(string name, PrimitiveType type)
         {
             entries.Add(new Entry(name, "GameObject Icon", () =>
             {
                 GameObject go = GameObject.CreatePrimitive(type);
-                go.transform.position = position;
+                PlaceLikeUnity(go);
                 Register(go, "Add " + name);
             }));
         }
@@ -331,7 +479,7 @@ public static class CuttlefishAddMenu
                     return;
                 }
                 GameObject go = new GameObject(name);
-                go.transform.position = position;
+                PlaceLikeUnity(go);
                 go.AddComponent<MeshFilter>().sharedMesh = mesh;
                 MeshRenderer renderer = go.AddComponent<MeshRenderer>();
                 GameObject materialSource = GameObject.CreatePrimitive(PrimitiveType.Cube);
@@ -354,7 +502,7 @@ public static class CuttlefishAddMenu
             {
                 GameObject go = new GameObject(name);
                 go.AddComponent<Light>().type = type;
-                go.transform.position = position;
+                PlaceLikeUnity(go);
                 Register(go, "Add " + name);
             }));
         }
@@ -364,7 +512,7 @@ public static class CuttlefishAddMenu
             entries.Add(new Entry(name, "GameObject Icon", () =>
             {
                 GameObject go = new GameObject(name);
-                go.transform.position = position;
+                PlaceLikeUnity(go);
                 go.AddComponent<T>();
                 Register(go, "Add " + name);
             }));
@@ -388,7 +536,8 @@ public static class CuttlefishAddMenu
                 }
 
                 GameObject go = new GameObject("Decal Projector");
-                go.transform.SetPositionAndRotation(position, rotation);
+                go.transform.rotation = spawnRotation;
+                    PlaceLikeUnity(go);
                 go.AddComponent(decalType);
                 Register(go, "Add Decal Projector");
             }));
@@ -410,9 +559,12 @@ public static class CuttlefishAddMenu
             if (!prefab) return;
             GameObject go = PrefabUtility.InstantiatePrefab(prefab) as GameObject;
             if (!go) return;
+            // Keep the prefab's contents, but make the newly created scene object independent.
+            // This removes the blue prefab-instance styling without altering the source asset.
+            PrefabUtility.UnpackPrefabInstance(go, PrefabUnpackMode.Completely, InteractionMode.UserAction);
             Undo.RegisterCreatedObjectUndo(go, "Add " + prefab.name);
             Undo.RecordObject(go.transform, "Position " + prefab.name);
-            go.transform.position = position;
+            PlaceLikeUnity(go);
             Selection.activeGameObject = go;
         }
 
@@ -422,7 +574,7 @@ public static class CuttlefishAddMenu
             Selection.activeGameObject = go;
         }
 
-        public override void OnGUI(Rect rect)
+        private void DrawRoot(Rect rect)
         {
             if (rowStyle == null)
             {
@@ -445,86 +597,56 @@ public static class CuttlefishAddMenu
 
             Event e = Event.current;
             bool searchFocused = GUI.GetNameOfFocusedControl() == "CuttlefishAddSearch";
-            if (e.type == EventType.KeyDown)
-            {
-                if (e.keyCode == KeyCode.Escape)
-                {
-                    if (ShowingResults) { searchText = ""; ResizeToContents(); }
-                    else if (openPage.Length > 0) CloseSubmenu();
-                    else editorWindow.Close();
-                    e.Use(); return;
-                }
-                if (!searchFocused && (e.keyCode == KeyCode.LeftArrow || e.keyCode == KeyCode.Backspace))
-                {
-                    CloseSubmenu(); e.Use(); return;
-                }
-                if (e.keyCode == KeyCode.DownArrow || e.keyCode == KeyCode.UpArrow)
-                {
-                    int count = ShowingResults ? SearchMatches().Count :
-                        openPage.Length > 0 ? NavigableEntries(openPage).Count : RootRowCount();
-                    if (count > 0)
-                    {
-                        selectedIndex = (selectedIndex + (e.keyCode == KeyCode.DownArrow ? 1 : count - 1)) % count;
-                        if (!ShowingRight) rootIndex = selectedIndex;
-                        else
-                        {
-                            float targetTop = Pad + selectedIndex * RowHeight;
-                            float visibleHeight = Mathf.Max(1f, GetWindowSize().y - Pad * 2f);
-                            if (targetTop < rightScroll.y) rightScroll.y = targetTop;
-                            if (targetTop + RowHeight > rightScroll.y + visibleHeight)
-                                rightScroll.y = targetTop + RowHeight - visibleHeight;
-                        }
-                    }
-                    e.Use(); editorWindow.Repaint(); return;
-                }
-                if (e.keyCode == KeyCode.RightArrow || e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter)
-                {
-                    if (ShowingResults || openPage.Length > 0)
-                    {
-                        List<Entry> items = ShowingResults ? SearchMatches() : NavigableEntries(openPage);
-                        if (items.Count > 0)
-                        {
-                            Entry item = items[Mathf.Clamp(selectedIndex, 0, items.Count - 1)];
-                            if (item.child != null) OpenSubmenu(item.child);
-                            else if (item.action != null) { item.action(); editorWindow.Close(); }
-                        }
-                    }
-                    else
-                    {
-                        List<Entry> choices = RootEntries().FindAll(item => !item.separator);
-                        Entry item = choices[Mathf.Clamp(selectedIndex, 0, choices.Count - 1)];
-                        if (item.child != null) OpenSubmenu(item.child);
-                        else if (item.action != null) { item.action(); editorWindow.Close(); }
-                    }
-                    e.Use(); return;
-                }
-            }
+            if (e.type == EventType.KeyDown && e.keyCode == KeyCode.Escape)
+            { CloseAll(); e.Use(); return; }
 
-            DrawNineSlice(new Rect(0, 0, rect.width, rect.height), roundedMenu, 6f);
+            EditorGUI.DrawRect(rect, new Color(.105f, .108f, .12f));
+            DrawNineSlice(rect, roundedMenu, 6f);
             GUI.SetNextControlName("CuttlefishAddSearch");
             Rect searchRect = new Rect(7, Pad, ColumnWidth - 14, 21);
             string typed = GUI.TextField(searchRect,
                 searchText, EditorStyles.textField);
+            if (refocusSearch)
+            {
+                EditorGUI.FocusTextInControl("CuttlefishAddSearch");
+                refocusSearch = false;
+            }
             if (string.IsNullOrEmpty(typed) && GUI.GetNameOfFocusedControl() != "CuttlefishAddSearch")
                 GUI.Label(new Rect(searchRect.x + 7, searchRect.y + 1, searchRect.width - 12, 19),
                     "Search...", searchHintStyle);
             if (typed != searchText)
             {
                 searchText = typed;
+                CancelPendingHover();
+                refocusSearch = true;
                 selectedIndex = 0;
                 if (ShowingResults) openPage = "";
                 ResizeToContents();
+                EditorGUI.FocusTextInControl("CuttlefishAddSearch");
             }
 
             List<Entry> roots = RootEntries();
+            if (e.type == EventType.MouseMove && (e.mousePosition.x < 4f || e.mousePosition.x > ColumnWidth - 4f ||
+                e.mousePosition.y < SearchHeight + Pad || e.mousePosition.y > RootHeight))
+                CancelPendingHover();
             DrawColumn(roots, 0f, ShowingResults ? -1 : rootIndex, false, SearchHeight);
 
-            if (ShowingRight)
-            {
-                EditorGUI.DrawRect(new Rect(ColumnWidth - 1, 0, 1, rect.height), new Color(.32f, .32f, .32f));
+            // Secondary content lives in its own native popup window.
+        }
+
+        private void DrawSecondary(Rect rect)
+        {
+            if (rowStyle == null || !ShowingRight || (ShowingResults && SearchMatches().Count == 0)) return;
+            EditorGUI.DrawRect(rect, new Color(.105f, .108f, .12f));
+            DrawNineSlice(rect, roundedMenu, 6f);
+            if (Event.current.type == EventType.KeyDown && Event.current.keyCode == KeyCode.Escape)
+            { CloseAll(); Event.current.Use(); return; }
+                if (Event.current.type == EventType.MouseLeaveWindow) CancelPendingFolder();
                 List<Entry> items = ShowingResults ? SearchMatches() : GetEntries(openPage);
                 float contentHeight = ContentHeight(items, false);
-                Rect viewport = new Rect(ColumnWidth + 2f, 4f, ColumnWidth - 10f, rect.height - 8f);
+                float panelHeight = Mathf.Min(MaxMenuHeight, contentHeight + 8f);
+
+                Rect viewport = new Rect(2f, 4f, ColumnWidth - 10f, panelHeight - 8f);
                 // Scroll only the right column, keeping the root menu and search fixed.
                 // Keep the entire scrollbar inside the popup with a 4px top/bottom margin.
                 // The row highlight also stops before the scrollbar instead of running underneath it.
@@ -544,17 +666,28 @@ public static class CuttlefishAddMenu
                 try
                 {
                     GUI.skin = narrowSkin;
-                    rightScroll = GUI.BeginScrollView(viewport, rightScroll,
-                        new Rect(0f, 0f, viewport.width - 10f, contentHeight), false, contentHeight > viewport.height);
-                    DrawColumn(items, 0f, selectedIndex, true, 0f);
-                    GUI.EndScrollView();
+                    bool needsScroll = (openPage.StartsWith("prefabs", StringComparison.Ordinal) || ShowingResults)
+                        && contentHeight > viewport.height;
+                    if (needsScroll)
+                    {
+                        rightScroll = GUI.BeginScrollView(viewport, rightScroll,
+                            new Rect(0f, 0f, viewport.width - 10f, contentHeight), false, true);
+                        DrawColumn(items, 0f, selectedIndex, true, 0f);
+                        GUI.EndScrollView();
+                    }
+                    else
+                    {
+                        rightScroll = Vector2.zero;
+                        GUI.BeginGroup(viewport);
+                        DrawColumn(items, 0f, selectedIndex, true, 0f);
+                        GUI.EndGroup();
+                    }
                 }
                 finally
                 {
                     GUI.skin = originalSkin;
                     UnityEngine.Object.DestroyImmediate(narrowSkin);
                 }
-            }
         }
 
         private List<Entry> RootEntries()
@@ -572,13 +705,14 @@ public static class CuttlefishAddMenu
                 {
                     GameObject go = new GameObject("Camera");
                     go.AddComponent<Camera>();
-                    go.transform.SetPositionAndRotation(position, rotation);
+                    go.transform.rotation = spawnRotation;
+                    PlaceLikeUnity(go);
                     Register(go, "Add Camera");
                 }),
                 new Entry("Audio Source", "Audio Icon", () =>
                 {
                     GameObject go = new GameObject("Audio Source");
-                    go.transform.position = position;
+                    PlaceLikeUnity(go);
                     go.AddComponent<AudioSource>();
                     Register(go, "Add Audio Source");
                 }),
@@ -642,6 +776,7 @@ public static class CuttlefishAddMenu
 
         private void OpenSubmenu(string destination)
         {
+            CancelPendingFolder();
             if (openPage == destination) return;
             if (openPage.Length > 0) pageHistory.Push(openPage);
             openPage = destination;
@@ -652,6 +787,7 @@ public static class CuttlefishAddMenu
 
         private void CloseSubmenu()
         {
+            CancelPendingFolder();
             if (pageHistory.Count > 0) openPage = pageHistory.Pop();
             else { openPage = ""; selectedIndex = Math.Max(0, rootIndex); }
             rightScroll = Vector2.zero;
@@ -676,7 +812,7 @@ public static class CuttlefishAddMenu
                 if (!submenu && selectableIndex >= MaxRows) break;
                 Rect r = new Rect(x + 4, y, ColumnWidth - (submenu ? 23f : 8f), RowHeight - 1f);
                 bool over = r.Contains(Event.current.mousePosition);
-                bool highlighted = selectableIndex == selection || over;
+                bool highlighted = over; // Highlight only the row under the mouse; do not persist selection.
                 if (highlighted)
                     DrawNineSlice(r, roundedHighlight, 4f);
 
@@ -718,37 +854,50 @@ public static class CuttlefishAddMenu
                     GUI.Label(new Rect(r.xMax - 15, r.y, 12, r.height), "›", rowStyle);
                 GUI.color = oldColor;
 
+                // Prefab folders open on hover, just like the main categories.
+                // Keep click handling for object creation and keyboard accessibility.
+                if (submenu && !ShowingResults && openPage.StartsWith("prefabs", StringComparison.Ordinal)
+                    && entry.child != null && over &&
+                    (Event.current.type == EventType.MouseMove || Event.current.type == EventType.MouseDrag))
+                {
+                    if (pendingFolderPage != entry.child)
+                    {
+                        pendingFolderPage = entry.child;
+                        pendingFolderSince = EditorApplication.timeSinceStartup;
+                    }
+                }
+                if (submenu && over && entry.child == null &&
+                    (Event.current.type == EventType.MouseMove || Event.current.type == EventType.MouseDrag))
+                    CancelPendingFolder();
                 if (over && Event.current.type == EventType.MouseDown && Event.current.button == 0)
                 {
-                    if (!submenu) rootIndex = selectableIndex;
+                    if (!submenu) { CancelPendingHover(); rootIndex = selectableIndex; }
                     if (entry.child != null) OpenSubmenu(entry.child);
                     else if (entry.action != null)
                     {
                         entry.action();
-                        editorWindow.Close();
+                        CloseAll();
                     }
                     Event.current.Use();
                     GUIUtility.ExitGUI();
                 }
-                if (over && Event.current.type == EventType.MouseMove)
+                if (over && !submenu && !ShowingResults &&
+                    (Event.current.type == EventType.MouseMove || Event.current.type == EventType.MouseDrag))
                 {
                     if (!submenu)
                     {
-                        if (!ShowingResults &&
-                            (rootIndex != selectableIndex || openPage != (entry.child ?? "")))
+                        if (entry.child == null) { CancelPendingHover(); }
+                        else if (rootIndex != selectableIndex || openPage != entry.child)
                         {
-                            rootIndex = selectableIndex;
-                            openPage = entry.child ?? "";
-                            selectedIndex = 0;
-                            pageHistory.Clear();
-                            ResizeToContents();
+                            if (pendingHoverIndex != selectableIndex || pendingHoverPage != (entry.child ?? ""))
+                            {
+                                pendingHoverIndex = selectableIndex;
+                                pendingHoverPage = entry.child ?? "";
+                                pendingHoverSince = EditorApplication.timeSinceStartup;
+                            }
                         }
                     }
-                    else
-                    {
-                        selectedIndex = selectableIndex;
-                    }
-                    editorWindow.Repaint();
+                    Repaint();
                 }
                 y += RowHeight;
                 selectableIndex++;
@@ -833,6 +982,16 @@ public static class CuttlefishAddMenu
 
         private static bool DrawCustomPrimitiveIcon(string label, string iconType, Rect rect)
         {
+            // Prefab assets always use prefab.png, regardless of their filename.
+            // In particular, a prefab called "Cube" or "Torus" must not inherit
+            // the icon used by the similarly named built-in primitive.
+            if (iconType == "Prefab Icon")
+            {
+                Texture2D prefabIcon = FindCustomIcon("prefab");
+                if (prefabIcon == null) return false;
+                GUI.DrawTexture(rect, prefabIcon, ScaleMode.ScaleToFit, true);
+                return true;
+            }
             // Match dedicated TMP/Legacy icons first; other UI entries use UI.png.
             string uiIcon = null;
             if (iconType == "Canvas Icon")

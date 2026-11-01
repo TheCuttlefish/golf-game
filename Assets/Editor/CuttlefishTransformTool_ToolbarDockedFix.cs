@@ -5,7 +5,7 @@ using UnityEditor;
 using System.Globalization;
 
 [InitializeOnLoad]
-public static class BlenderTransformTool
+public static class CuttlefishTransformTool
 {
     private enum Mode { None, Move, Rotate, Scale, Trackball }
     private static Mode mode = Mode.None;
@@ -98,12 +98,12 @@ public static class BlenderTransformTool
         return texture;
     }
 
-    // Works with the existing CuttlefishAddMenu.cs; no second updated script required.
+    // Toolbar + Add: anchor the independent Add Menu directly below Cuttlefish.
+    // Shift+A continues to use its own mouse-based positioning in CuttlefishAddMenu.
     private static void OpenExistingAddMenu(Rect anchor, SceneView scene)
     {
         if (scene == null) return;
-        // PopupWindow.Show expects a GUI-space anchor and converts it internally.
-        Rect guiAnchor = anchor;
+        Vector2 screenPoint = GUIUtility.GUIToScreenPoint(new Vector2(anchor.x, anchor.y));
         Vector3 pivot = scene.pivot;
         Quaternion rotation = scene.rotation;
         EditorApplication.delayCall += () =>
@@ -114,24 +114,44 @@ public static class BlenderTransformTool
                 menuType = assembly.GetType("CuttlefishAddMenu", false);
                 if (menuType != null) break;
             }
-            if (menuType == null)
-            {
-                Debug.LogWarning("Cuttlefish Add Menu was not found. Keep your existing CuttlefishAddMenu.cs in Assets/Editor.");
-                return;
-            }
-            var popupType = menuType.GetNestedType("AddPopup", System.Reflection.BindingFlags.NonPublic);
-            var constructor = popupType?.GetConstructor(
-                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance,
-                null, new[] { typeof(Vector3), typeof(Quaternion) }, null);
-            if (constructor == null)
-            {
-                // Fall back to the existing Tools command if the popup implementation changes.
-                EditorApplication.ExecuteMenuItem("Tools/Cuttlefish Add Menu");
-                return;
-            }
-            var popup = constructor.Invoke(new object[] { pivot, rotation }) as PopupWindowContent;
-            if (popup != null) PopupWindow.Show(guiAnchor, popup);
+            var popupType = menuType?.GetNestedType("AddPopup",
+                System.Reflection.BindingFlags.NonPublic);
+            var showAt = popupType?.GetMethod("ShowAt",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static,
+                null, new[] { typeof(Vector2), typeof(Vector3), typeof(Quaternion) }, null);
+            if (showAt != null)
+                showAt.Invoke(null, new object[] { screenPoint, pivot, rotation });
+            else
+                Debug.LogWarning("Cuttlefish Add Menu ShowAt was not found. Keep the current CuttlefishAddMenu.cs installed.");
         };
+    }
+
+    // Use the Action Menu's explicit screen-position entry point.
+    private static void OpenExistingActionMenu(Rect anchor, SceneView scene)
+    {
+        if (scene == null) return;
+        // The anchor is already in Scene View GUI coordinates. Do not convert it
+        // to screen coordinates or defer the call: PopupWindow.Show handles that.
+        CuttlefishSceneActionMenu.ShowAtToolbarGUI(anchor, scene);
+    }
+
+    private static Texture2D axisIcon;
+    private static bool axisIconSearched;
+    private static Texture2D GetAxisIcon()
+    {
+        if (axisIconSearched) return axisIcon;
+        axisIconSearched = true;
+        // Search by filename so the user's PNG can live anywhere under Assets.
+        foreach (string guid in AssetDatabase.FindAssets("axis t:Texture2D"))
+        {
+            string path = AssetDatabase.GUIDToAssetPath(guid);
+            if (path.EndsWith("/axis.png", System.StringComparison.OrdinalIgnoreCase))
+            {
+                axisIcon = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
+                break;
+            }
+        }
+        return axisIcon;
     }
 
     private static bool ctrlHeld;
@@ -177,28 +197,39 @@ public static class BlenderTransformTool
     private const string PanelXKey = "BlenderTransformTool.PanelOffsetX";
     private const string PanelYKey = "BlenderTransformTool.PanelOffsetY";
     private static Vector2 panelOffset;
+    private const string CollapsedKey = "BlenderTransformTool.PanelCollapsed";
+    private static bool panelCollapsed;
     private static bool draggingPanel;
     private static Vector2 dragMouseStart, dragOffsetStart;
 
-    static BlenderTransformTool()
+    static CuttlefishTransformTool()
     {
         enabledMode = EditorPrefs.GetBool(PrefKey, false);
+        panelCollapsed = EditorPrefs.GetBool(CollapsedKey, false);
         panelOffset = new Vector2(EditorPrefs.GetFloat(PanelXKey, 0f),
                                   EditorPrefs.GetFloat(PanelYKey, 0f));
         SceneView.duringSceneGui += OnSceneGUI;
+        Selection.selectionChanged += OnSelectionChanged;
         EditorApplication.projectChanged += () => { logoSearched = false; cuttlefishLogo = null; };
     }
 
-    [MenuItem("Tools/Cuttlefish Mode _F1", priority = 100)]
+    // Scene View does not always repaint when selection is cleared in the Hierarchy.
+    // Refresh the toolbar counters immediately for both selection and deselection.
+    private static void OnSelectionChanged()
+    {
+        SceneView.RepaintAll();
+    }
+
+    [MenuItem("Tools/Cuttlefish Mode", priority = 100)]
     private static void ToggleFromMenu()
     {
         ToggleCuttlefishMode();
     }
 
-    [MenuItem("Tools/Cuttlefish Mode _F1", true)]
+    [MenuItem("Tools/Cuttlefish Mode", true)]
     private static bool ValidateCuttlefishMenu()
     {
-        Menu.SetChecked("Tools/Cuttlefish Mode _F1", enabledMode);
+        Menu.SetChecked("Tools/Cuttlefish Mode", enabledMode);
         return true;
     }
 
@@ -210,6 +241,63 @@ public static class BlenderTransformTool
         SceneView.RepaintAll();
     }
 
+    private static void SetPanelCollapsed(bool collapsed)
+    {
+        panelCollapsed = collapsed;
+        EditorPrefs.SetBool(CollapsedKey, collapsed);
+        SceneView.RepaintAll();
+    }
+
+    // Update hover state on input events, then repaint the Scene view immediately.
+    // IMGUI does not automatically repaint when the mouse crosses custom GUI textures.
+    private static float logoHover = 0f;
+    private static double logoHoverUpdatedAt = 0d;
+    private static bool logoWasHovered = false;
+    private static readonly Color LogoIceBlue = new Color(255f / 255f, 180f / 255f, 106f / 255f, 1f); // #FFB46A
+
+    private static void UpdateLogoHover(Rect area)
+    {
+        Event e = Event.current;
+        bool hovered = area.Contains(e.mousePosition);
+        double now = EditorApplication.timeSinceStartup;
+        if (hovered != logoWasHovered)
+        {
+            logoWasHovered = hovered;
+            if (hovered)
+            {
+                logoHover = 1f; // immediate response
+                EditorApplication.update -= AnimateLogoHoverOut;
+            }
+            else
+            {
+                logoHoverUpdatedAt = now;
+                EditorApplication.update -= AnimateLogoHoverOut;
+                EditorApplication.update += AnimateLogoHoverOut;
+            }
+            SceneView.RepaintAll();
+        }
+    }
+
+    private static void AnimateLogoHoverOut()
+    {
+        double now = EditorApplication.timeSinceStartup;
+        float delta = (float)System.Math.Max(0d, now - logoHoverUpdatedAt);
+        logoHoverUpdatedAt = now;
+        logoHover = Mathf.Max(0f, logoHover - delta / 0.22f);
+        SceneView.RepaintAll();
+        if (logoHover <= 0f) EditorApplication.update -= AnimateLogoHoverOut;
+    }
+
+    private static void DrawTintedLogo(Rect area, Texture2D texture)
+    {
+        if (texture == null) return;
+        UpdateLogoHover(area);
+        Color old = GUI.color;
+        GUI.color = Color.Lerp(Color.white, LogoIceBlue, logoHover);
+        GUI.DrawTexture(area, texture, ScaleMode.ScaleToFit, true);
+        GUI.color = old;
+    }
+
     private static void OnSceneGUI(SceneView scene)
     {
         Event e = Event.current;
@@ -218,16 +306,21 @@ public static class BlenderTransformTool
         if (e.type == EventType.MouseDown && e.button == 1 && mode == Mode.None) rightMouseHeld = true;
         if (e.type == EventType.MouseUp && e.button == 1) rightMouseHeld = false;
 
-        // F1 works even when Blender Mode is disabled, provided Scene view has focus.
-        if (e.type == EventType.KeyDown && e.keyCode == KeyCode.F1 && !e.alt && !e.control && !e.command)
+        if (!enabledMode) return;
+        // Receive mouse movement even when no standard IMGUI control is hot.
+        scene.wantsMouseMove = true;
+        if (e.type == EventType.MouseMove || e.type == EventType.MouseDrag)
+            scene.Repaint();
+        // N collapses/expands the UI without disabling Cuttlefish transforms.
+        if (e.type == EventType.KeyDown && e.keyCode == KeyCode.N &&
+            !e.alt && !e.control && !e.command && !e.shift && mode == Mode.None)
         {
-            ToggleCuttlefishMode();
+            SetPanelCollapsed(!panelCollapsed);
             e.Use();
             scene.Repaint();
             return;
         }
-        if (!enabledMode) return;
-        if (HandlePanelDrag(e, scene))
+        if (!panelCollapsed && HandlePanelDrag(e, scene))
         {
             DrawOverlay(scene);
             return;
@@ -1645,6 +1738,26 @@ public static class BlenderTransformTool
             Handles.color = oldGuiColor;
         }
         Rect rect = PanelRect(scene);
+        if (panelCollapsed && mode == Mode.None)
+        {
+            // Retain the toolbar's right edge so expanding restores its exact position.
+            Rect tab = new Rect(rect.xMax - 38f, rect.y, 38f, 34f);
+            GUI.Box(tab, GUIContent.none, PanelStyle());
+            Texture2D tabLogo = GetCuttlefishLogo();
+            if (tabLogo != null)
+                DrawTintedLogo(new Rect(tab.x + 5f, tab.y + 3f, 28f, 28f), tabLogo);
+            else
+            {
+                GUIStyle fallback = new GUIStyle(EditorStyles.boldLabel)
+                    { alignment = TextAnchor.MiddleCenter, fontSize = 18 };
+                fallback.normal.textColor = new Color(1f, 0.58f, 0.19f);
+                GUI.Label(tab, "C", fallback);
+            }
+            if (GUI.Button(tab, new GUIContent("", "Expand Menu N̲"), GUIStyle.none))
+                SetPanelCollapsed(false);
+            Handles.EndGUI();
+            return;
+        }
         GUI.Box(rect, GUIContent.none, PanelStyle());
         // Three-line drag grip, like Unity's built-in Scene view toolbar.
         Color gripColor = EditorGUIUtility.isProSkin
@@ -1667,8 +1780,12 @@ public static class BlenderTransformTool
             fontSize = 12, normal = { textColor = new Color(0.92f, 0.94f, 0.97f) }
         };
         Texture2D logo = GetCuttlefishLogo();
+        Rect logoRect = new Rect(rect.x + 27f, rect.y + 2f, 28f, 28f);
         if (logo != null)
-            GUI.DrawTexture(new Rect(rect.x + 27f, rect.y + 2f, 28f, 28f), logo, ScaleMode.ScaleToFit, true);
+            DrawTintedLogo(logoRect, logo);
+        if (mode == Mode.None &&
+            GUI.Button(logoRect, new GUIContent("", "Hide Menu N̲"), GUIStyle.none))
+            SetPanelCollapsed(true);
         // Compact raised button; preserve the original logo size and position.
         GUIStyle addButtonStyle = new GUIStyle(EditorStyles.miniButton)
         {
@@ -1686,7 +1803,7 @@ public static class BlenderTransformTool
         addButtonStyle.onHover.textColor = Color.white;
         addButtonStyle.onActive.textColor = Color.white;
         addButtonStyle.onFocused.textColor = Color.white;
-        Rect addButtonRect = new Rect(rect.x + (logo != null ? 64f : 27f), rect.y + (rect.height - 24f) * 0.5f + 3f, 72f, 24f);
+        Rect addButtonRect = new Rect(rect.x + (logo != null ? 64f : 27f), rect.y + 7f, 72f, 24f);
         // Render the orange fill *as the button background*, not behind a gray Unity skin.
         GUIStyle orangeButton = new GUIStyle(addButtonStyle);
         orangeButton.normal.background = MakeAddButtonTexture(new Color(0.93f, 0.39f, 0.10f), 72, 24);
@@ -1694,14 +1811,41 @@ public static class BlenderTransformTool
         orangeButton.active.background = MakeAddButtonTexture(new Color(0.76f, 0.29f, 0.07f), 72, 24);
         orangeButton.focused.background = orangeButton.normal.background;
         orangeButton.border = new RectOffset(5, 5, 5, 5);
-        if (GUI.Button(addButtonRect, "+ Add", orangeButton))
+        if (GUI.Button(addButtonRect, new GUIContent("+ Add", "Add S̲hift + A̲"), orangeButton))
         {
             // Anchor at the overlay's lower edge, aligned with the overlay left edge.
-            Rect popupAnchor = new Rect(rect.x, rect.yMax + 53f, 0f, 0f);
+            Rect popupAnchor = new Rect(addButtonRect.x, addButtonRect.yMax + 4f, 0f, 0f);
             OpenExistingAddMenu(popupAnchor, scene);
         }
+        // Object Properties: the same gray mini-button treatment as + Add.
+        // Its custom axis.png artwork is drawn at 19x19 inside the button.
+        Rect actionsButton = new Rect(addButtonRect.xMax + 8f,
+            addButtonRect.y, 28f, addButtonRect.height);
+        GUIStyle propertiesButton = new GUIStyle(addButtonStyle);
+        propertiesButton.normal.background = MakeAddButtonTexture(new Color(0.30f, 0.31f, 0.34f), 28, 24);
+        propertiesButton.hover.background = MakeAddButtonTexture(new Color(1f, 0.48f, 0.16f), 28, 24);
+        propertiesButton.active.background = MakeAddButtonTexture(new Color(0.76f, 0.29f, 0.07f), 28, 24);
+        propertiesButton.focused.background = propertiesButton.normal.background;
+        propertiesButton.border = new RectOffset(5, 5, 5, 5);
+        if (GUI.Button(actionsButton, new GUIContent("", "Spatial Tools S̲pace"), propertiesButton))
+        {
+            Rect popupAnchor = new Rect(actionsButton.x, addButtonRect.yMax + 4f, 0f, 0f);
+            OpenExistingActionMenu(popupAnchor, scene);
+        }
+        Texture2D iconTexture = GetAxisIcon();
+        if (iconTexture != null)
+        {
+            Rect iconRect = new Rect(actionsButton.center.x - 9.5f + 1f,
+                actionsButton.center.y - 9.5f - 2f, 19f, 19f);
+            GUI.DrawTexture(iconRect, iconTexture, ScaleMode.ScaleToFit, true);
+        }
         // Primary selection count, with a quieter triangle count to its right.
-        int selectedCount = Selection.gameObjects.Length;
+        // Count only actual selected scene objects. An asset or stale selection
+        // must never leave a nonzero Scene View object counter.
+        int selectedCount = Selection.activeGameObject == null
+            ? 0
+            : System.Array.FindAll(Selection.gameObjects, go =>
+                go != null && go.scene.IsValid() && go.scene.isLoaded).Length;
         string countText = selectedCount.ToString(CultureInfo.InvariantCulture);
         string trisText = "Tris: " + SelectedTriangleCount().ToString("N0", CultureInfo.InvariantCulture);
         GUIContent objectIcon = EditorGUIUtility.IconContent("GameObject Icon");
@@ -1723,10 +1867,10 @@ public static class BlenderTransformTool
         const float gap = 10f;
         float trisWidth = Mathf.Max(43f, trisStyle.CalcSize(new GUIContent(trisText)).x + 2f);
         float trisX = rect.xMax - rightPadding - trisWidth;
-        GUI.Label(new Rect(trisX, rect.y + 6, trisWidth, 19), trisText, trisStyle);
+        GUI.Label(new Rect(trisX, rect.y + 7, trisWidth, 19), trisText, trisStyle);
         float countWidth = Mathf.Max(17f, countStyle.CalcSize(new GUIContent(countText)).x + 3f);
         float countX = trisX - gap - countWidth;
-        GUI.Label(new Rect(countX, rect.y + 6, countWidth, 19), countText, countStyle);
+        GUI.Label(new Rect(countX, rect.y + 7, countWidth, 19), countText, countStyle);
         if (objectIcon != null && objectIcon.image != null)
             GUI.DrawTexture(new Rect(countX - 17f, rect.y + 9, 15, 15), objectIcon.image, ScaleMode.ScaleToFit);
         if (mode != Mode.None)

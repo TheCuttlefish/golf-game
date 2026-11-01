@@ -24,15 +24,53 @@ public static class CuttlefishSceneActionMenu
         if (e == null || e.type != EventType.KeyDown || e.keyCode != KeyCode.Space ||
             e.alt || e.shift || e.control || e.command || EditorGUIUtility.editingTextField ||
             GUIUtility.hotControl != 0) return;
-        // Exactly the same GUI-local anchor approach as CuttlefishAddMenu's Shift+A.
-        Vector2 at = e.mousePosition;
+        // Match Shift+A: capture the cursor in screen coordinates while Scene GUI is active.
+        Vector2 cursorScreen = GUIUtility.GUIToScreenPoint(e.mousePosition);
+        Vector2 popupScreen = FindSpaceOpeningPoint(view, cursorScreen);
+        // PopupWindow.Show converts a GUI anchor to screen space itself. Convert back
+        // while the Scene GUI context is valid, and show BEFORE leaving this event.
+        Vector2 popupGUI = GUIUtility.ScreenToGUIPoint(popupScreen);
         e.Use();
         if (openPopup != null) { ClosePopup(); return; }
-        Rect anchor = new Rect(at.x, at.y, 1, 1);
-        EditorApplication.delayCall += () =>
-        {
-            if (view != null) PopupWindow.Show(anchor, new ActionPopup(view));
-        };
+        PopupWindow.Show(new Rect(popupGUI.x, popupGUI.y, 1f, 1f), new ActionPopup(view));
+    }
+
+    // Same Scene View screen-space bounds logic as the working Shift+A menu.
+    // The Space popup has only one column, so no secondary-column reservation.
+    private static Vector2 FindSpaceOpeningPoint(SceneView view, Vector2 cursorScreen)
+    {
+        const float popupWidth = 192f;
+        const float popupHeight = 160f;
+        const float edgeMargin = 8f;
+        Vector2 sceneOrigin = GUIUtility.GUIToScreenPoint(Vector2.zero);
+        Rect bounds = new Rect(sceneOrigin.x, sceneOrigin.y,
+                               view.position.width, view.position.height);
+        // Preserve the user's preferred keyboard-only cursor offset.
+        Vector2 point = cursorScreen + new Vector2(0f, 0f);
+        point.x = Mathf.Clamp(point.x, bounds.xMin + edgeMargin,
+            Mathf.Max(bounds.xMin + edgeMargin, bounds.xMax - popupWidth - edgeMargin));
+        point.y = Mathf.Clamp(point.y, bounds.yMin + edgeMargin,
+            Mathf.Max(bounds.yMin + edgeMargin, bounds.yMax - popupHeight - edgeMargin));
+        return point;
+    }
+
+    // Toolbar-only entry: call during SceneView OnGUI, while the GUI coordinates are valid.
+    // PopupWindow.Show expects a GUI-space anchor and handles conversion itself.
+    public static void ShowAtToolbarGUI(Rect guiAnchor, SceneView view)
+    {
+        if (view == null) return;
+        if (openPopup != null) { ClosePopup(); return; }
+        PopupWindow.Show(guiAnchor, new ActionPopup(view));
+    }
+
+    // Called only by the Cuttlefish toolbar. Screen-space anchor matches + Add.
+    // Spacebar's cursor-position behavior remains unchanged.
+    public static void ShowAtScreen(Vector2 screenPoint, SceneView view)
+    {
+        if (view == null) return;
+        if (openPopup != null) { ClosePopup(); return; }
+        PopupWindow.Show(new Rect(screenPoint.x, screenPoint.y, 1f, 1f),
+                         new ActionPopup(view));
     }
 
     [MenuItem("Tools/Cuttlefish Action Menu _SPACE")]
