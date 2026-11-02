@@ -1,11 +1,14 @@
-// CuttlefishAddMenu.cs — Unity 6.x editor-only Shift+A popup.
-// Place in Assets/Editor. Remove older BlenderAddMenu/CuttlefishAddMenu scripts to avoid duplicates.
+// CuttlefishAddMenu.cs — Cuttlefish Editor add menu (Unity 6.x).
+// Install under Assets/Cuttlefish/Editor. Remove older copies of this class.
+#if UNITY_EDITOR
 using System;
 using System.Collections.Generic;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
 
+namespace Cuttlefish.Editor
+{
 [InitializeOnLoad]
 public static class CuttlefishAddMenu
 {
@@ -25,6 +28,69 @@ public static class CuttlefishAddMenu
 
     // Lets the Space Menu avoid refocusing the Scene View over an open Add popup.
     public static bool IsOpen { get { return AddPopup.IsOpen; } }
+
+    // Stable entry point for the Cuttlefish toolbar. Unlike the original
+    // implementation, callers do not need reflection into nested EditorWindow types.
+    public static void ShowAtScreen(Vector2 screenPoint, Vector3 spawnPosition, Quaternion spawnRotation)
+    {
+        if (AddPopup.IsOpen) return;
+        AddPopup.ShowAt(screenPoint, spawnPosition, spawnRotation);
+    }
+
+    // Package-root discovery works both for legacy Assets/Editor installs and
+    // packages installed under Assets/Cuttlefish/Editor (including subfolders).
+    private static string packageRoot;
+    public static string PackageRoot
+    {
+        get
+        {
+            if (!string.IsNullOrEmpty(packageRoot) && AssetDatabase.IsValidFolder(packageRoot))
+                return packageRoot;
+            foreach (string guid in AssetDatabase.FindAssets("CuttlefishAddMenu t:MonoScript"))
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                if (!path.EndsWith("/CuttlefishAddMenu.cs", StringComparison.OrdinalIgnoreCase)) continue;
+                int editor = path.IndexOf("/Editor/", StringComparison.OrdinalIgnoreCase);
+                if (editor > 0)
+                {
+                    packageRoot = path.Substring(0, editor);
+                    return packageRoot;
+                }
+                if (path.EndsWith("/Editor/CuttlefishAddMenu.cs", StringComparison.OrdinalIgnoreCase))
+                {
+                    packageRoot = path.Substring(0, path.Length - "/Editor/CuttlefishAddMenu.cs".Length);
+                    return packageRoot;
+                }
+            }
+            return "Assets";
+        }
+    }
+
+    // Resolve bundled models by file name under the package, not a hard-coded
+    // Assets/Editor folder. Prefer .fbx; accept legacy .blend imports for testing.
+    private static string FindBundledMeshPath(string modelName)
+    {
+        string fbxFallback = null;
+        string blenderFallback = null;
+        foreach (string guid in AssetDatabase.FindAssets(modelName, new[] { PackageRoot }))
+        {
+            string path = AssetDatabase.GUIDToAssetPath(guid);
+            string fileName = System.IO.Path.GetFileNameWithoutExtension(path);
+            if (!string.Equals(fileName, modelName, StringComparison.OrdinalIgnoreCase)) continue;
+            string extension = System.IO.Path.GetExtension(path);
+            bool fbx = string.Equals(extension, ".fbx", StringComparison.OrdinalIgnoreCase);
+            bool blend = string.Equals(extension, ".blend", StringComparison.OrdinalIgnoreCase);
+            if (!fbx && !blend) continue;
+            // Older installations store models in Editor/CuttlefishMeshes;
+            // release packages should store them in Cuttlefish/Meshes.
+            bool bundled = path.IndexOf("/Meshes/", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                           path.IndexOf("/CuttlefishMeshes/", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (bundled && fbx) return path;
+            if (fbx && fbxFallback == null) fbxFallback = path;
+            if (blend && blenderFallback == null) blenderFallback = path;
+        }
+        return fbxFallback ?? blenderFallback;
+    }
 
     // Diagnostic fallback: use this menu command to verify the new script loaded.
     [MenuItem("Tools/Cuttlefish Add Menu #a")]
@@ -190,6 +256,16 @@ public static class CuttlefishAddMenu
             EditorApplication.update -= OnEditorUpdate;
             if (secondary != null) { SecondaryWindow old = secondary; secondary = null; old.Close(); }
             if (active == this) active = null;
+            // These textures are generated per popup and must not accumulate
+            // during a long editor session. Destroy after IMGUI is finished.
+            Texture2D a = background, b = roundedHighlight, c = roundedMenu;
+            background = roundedHighlight = roundedMenu = null;
+            EditorApplication.delayCall += () =>
+            {
+                if (a != null) UnityEngine.Object.DestroyImmediate(a);
+                if (b != null) UnityEngine.Object.DestroyImmediate(b);
+                if (c != null) UnityEngine.Object.DestroyImmediate(c);
+            };
         }
         private void OnLostFocus()
         {
@@ -464,19 +540,12 @@ public static class CuttlefishAddMenu
             }
         }
 
-        // Use Unity's native Scene View placement when available instead of
-        // placing new objects at the Scene View orbit pivot (which may be distant).
+        // Place newly created objects in front of the Scene View using public
+        // Unity APIs. Avoid reflection into UnityEditor.SceneView's internal API,
+        // which is not permitted for Asset Store Editor extensions.
         private void PlaceLikeUnity(GameObject go)
         {
             if (!go) return;
-            var method = typeof(SceneView).GetMethod("PlaceGameObjectInFrontOfSceneView",
-                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic |
-                System.Reflection.BindingFlags.Static, null, new[] { typeof(GameObject) }, null);
-            if (method != null)
-            {
-                try { method.Invoke(null, new object[] { go }); return; }
-                catch (System.Exception) { /* Fall back for other Unity versions. */ }
-            }
             SceneView view = SceneView.lastActiveSceneView;
             if (view != null && view.camera != null)
                 go.transform.position = view.camera.transform.position + view.camera.transform.forward * 10f;
@@ -499,12 +568,12 @@ public static class CuttlefishAddMenu
         {
             entries.Add(new Entry(name, "GameObject Icon", () =>
             {
-                string folder = "Assets/Editor/CuttlefishMeshes/";
-                string path = folder + modelFile + ".fbx";
-                if (AssetDatabase.LoadMainAssetAtPath(path) == null)
+                string path = FindBundledMeshPath(modelFile);
+                if (string.IsNullOrEmpty(path))
                 {
-                    // Blender files can also be imported as .blend assets.
-                    path = folder + modelFile + ".blend";
+                    Debug.LogWarning("Cuttlefish Add Menu: Missing model " + modelFile +
+                        ".fbx. Place Cuttlefish's FBX files inside the package's Meshes folder.");
+                    return;
                 }
                 Mesh mesh = null;
                 foreach (UnityEngine.Object asset in AssetDatabase.LoadAllAssetsAtPath(path))
@@ -992,7 +1061,8 @@ public static class CuttlefishAddMenu
                         tex, new Rect(us[x], 1f - us[y+1], us[x+1]-us[x], us[y+1]-us[y]));
         }
 
-        // Load the user's icons from anywhere under Assets/Editor, including subfolders.
+        // Load packaged icons from the folder containing the product, even when
+        // the product is moved into Assets/Cuttlefish.
         // Icon names match the PNG filenames, including sun, spot-light, and point-light (case-insensitive).
         private static readonly Dictionary<string, Texture2D> customIconCache = new Dictionary<string, Texture2D>();
 
@@ -1001,7 +1071,7 @@ public static class CuttlefishAddMenu
             if (customIconCache.TryGetValue(iconName, out Texture2D cached) && cached != null)
                 return cached;
 
-            foreach (string guid in AssetDatabase.FindAssets(iconName + " t:Texture2D", new[] { "Assets/Editor" }))
+            foreach (string guid in AssetDatabase.FindAssets(iconName + " t:Texture2D", new[] { PackageRoot }))
             {
                 string path = AssetDatabase.GUIDToAssetPath(guid);
                 if (!string.Equals(System.IO.Path.GetFileNameWithoutExtension(path), iconName,
@@ -1178,3 +1248,5 @@ public static class CuttlefishAddMenu
         }
     }
 }
+}
+#endif

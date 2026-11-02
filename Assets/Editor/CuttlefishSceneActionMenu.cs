@@ -4,6 +4,8 @@
 using UnityEditor;
 using UnityEngine;
 
+namespace Cuttlefish.Editor
+{
 [InitializeOnLoad]
 public static class CuttlefishSceneActionMenu
 {
@@ -361,4 +363,6 @@ public static class CuttlefishSceneActionMenu
         SceneView.RepaintAll();
     }
 }
+}
+
 #endif

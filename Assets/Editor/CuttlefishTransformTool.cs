@@ -1,9 +1,12 @@
 // Blender-style modal transforms for Unity 6.3 LTS.
-// Place this file inside Assets/Editor/.
+// Install under Assets/Cuttlefish/Editor along with the other Cuttlefish scripts.
+#if UNITY_EDITOR
 using UnityEngine;
 using UnityEditor;
 using System.Globalization;
 
+namespace Cuttlefish.Editor
+{
 [InitializeOnLoad]
 public static class CuttlefishTransformTool
 {
@@ -56,7 +59,7 @@ public static class CuttlefishTransformTool
     {
         if (logoSearched) return cuttlefishLogo;
         logoSearched = true;
-        foreach (string guid in AssetDatabase.FindAssets("cuttlefish-256-logo t:Texture2D"))
+        foreach (string guid in AssetDatabase.FindAssets("cuttlefish-256-logo t:Texture2D", new[] { CuttlefishAddMenu.PackageRoot }))
         {
             string path = AssetDatabase.GUIDToAssetPath(guid);
             if (path.EndsWith("/cuttlefish-256-logo.png", System.StringComparison.OrdinalIgnoreCase))
@@ -107,31 +110,14 @@ public static class CuttlefishTransformTool
         Vector3 pivot = scene.pivot;
         Quaternion rotation = scene.rotation;
         EditorApplication.delayCall += () =>
-        {
-            System.Type menuType = null;
-            foreach (var assembly in System.AppDomain.CurrentDomain.GetAssemblies())
-            {
-                menuType = assembly.GetType("CuttlefishAddMenu", false);
-                if (menuType != null) break;
-            }
-            var popupType = menuType?.GetNestedType("AddPopup",
-                System.Reflection.BindingFlags.NonPublic);
-            var showAt = popupType?.GetMethod("ShowAt",
-                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static,
-                null, new[] { typeof(Vector2), typeof(Vector3), typeof(Quaternion) }, null);
-            if (showAt != null)
-                showAt.Invoke(null, new object[] { screenPoint, pivot, rotation });
-            else
-                Debug.LogWarning("Cuttlefish Add Menu ShowAt was not found. Keep the current CuttlefishAddMenu.cs installed.");
-        };
+            CuttlefishAddMenu.ShowAtScreen(screenPoint, pivot, rotation);
     }
 
     // Use the Action Menu's explicit screen-position entry point.
     private static void OpenExistingActionMenu(Rect anchor, SceneView scene)
     {
         if (scene == null) return;
-        // The anchor is already in Scene View GUI coordinates. Do not convert it
-        // to screen coordinates or defer the call: PopupWindow.Show handles that.
+        // The Action Menu converts this Scene GUI-space anchor internally.
         CuttlefishSceneActionMenu.ShowAtToolbarGUI(anchor, scene);
     }
 
@@ -142,7 +128,7 @@ public static class CuttlefishTransformTool
         if (axisIconSearched) return axisIcon;
         axisIconSearched = true;
         // Search by filename so the user's PNG can live anywhere under Assets.
-        foreach (string guid in AssetDatabase.FindAssets("axis t:Texture2D"))
+        foreach (string guid in AssetDatabase.FindAssets("axis t:Texture2D", new[] { CuttlefishAddMenu.PackageRoot }))
         {
             string path = AssetDatabase.GUIDToAssetPath(guid);
             if (path.EndsWith("/axis.png", System.StringComparison.OrdinalIgnoreCase))
@@ -197,15 +183,38 @@ public static class CuttlefishTransformTool
     private const string PanelXKey = "BlenderTransformTool.PanelOffsetX";
     private const string PanelYKey = "BlenderTransformTool.PanelOffsetY";
     private static Vector2 panelOffset;
-    private const string CollapsedKey = "BlenderTransformTool.PanelCollapsed";
-    private static bool panelCollapsed;
+    // The native Scene View overlay owns the toolbar UI when installed.
+    // Modal transform input and world-space guides remain in duringSceneGui.
+    private static int nativeOverlayInstances;
+    internal static bool NativeOverlayActive => nativeOverlayInstances > 0;
+
+    internal static Texture2D NativeOverlayLogo => GetCuttlefishLogo();
+
+    internal static void NativeOverlayAttached()
+    {
+        nativeOverlayInstances++;
+        SceneView.RepaintAll();
+    }
+
+    internal static void NativeOverlayDetached()
+    {
+        nativeOverlayInstances = Mathf.Max(0, nativeOverlayInstances - 1);
+        SceneView.RepaintAll();
+    }
+
+    // Clicks still activate toolbar buttons. Holding the mouse and moving at
+    // least a few GUI points turns that press into a panel drag instead.
     private static bool draggingPanel;
-    private static Vector2 dragMouseStart, dragOffsetStart;
+    private static bool panelDragArmed;
+    private static Vector2 dragMouseStart;
+    private static Rect dragStartExpandedRect;
 
     static CuttlefishTransformTool()
     {
-        enabledMode = EditorPrefs.GetBool(PrefKey, false);
-        panelCollapsed = EditorPrefs.GetBool(CollapsedKey, false);
+        // The Tools menu now controls the native overlay presentation, not whether
+        // transforms work. Keep Cuttlefish active even when tucked into the bar.
+        enabledMode = true;
+        EditorPrefs.SetBool(PrefKey, true);
         panelOffset = new Vector2(EditorPrefs.GetFloat(PanelXKey, 0f),
                                   EditorPrefs.GetFloat(PanelYKey, 0f));
         SceneView.duringSceneGui += OnSceneGUI;
@@ -220,16 +229,26 @@ public static class CuttlefishTransformTool
         SceneView.RepaintAll();
     }
 
+    // Checked = full floating Cuttlefish overlay; unchecked = compact native
+    // overlay in Unity's top Scene View toolbar. The editing shortcuts remain on.
     [MenuItem("Tools/Cuttlefish Mode", priority = 100)]
     private static void ToggleFromMenu()
     {
-        ToggleCuttlefishMode();
+        bool expand = !CuttlefishSceneOverlay.IsExpandedInActiveSceneView();
+        // Menu commands can execute during GUI processing. Change overlay
+        // containers after the current event to avoid UI Toolkit tree conflicts.
+        EditorApplication.delayCall += () =>
+        {
+            CuttlefishSceneOverlay.SetExpandedInActiveSceneView(expand);
+            SceneView.RepaintAll();
+        };
     }
 
     [MenuItem("Tools/Cuttlefish Mode", true)]
     private static bool ValidateCuttlefishMenu()
     {
-        Menu.SetChecked("Tools/Cuttlefish Mode", enabledMode);
+        Menu.SetChecked("Tools/Cuttlefish Mode",
+            CuttlefishSceneOverlay.IsExpandedInActiveSceneView());
         return true;
     }
 
@@ -238,13 +257,6 @@ public static class CuttlefishTransformTool
         if (mode != Mode.None) Cancel();
         enabledMode = !enabledMode;
         EditorPrefs.SetBool(PrefKey, enabledMode);
-        SceneView.RepaintAll();
-    }
-
-    private static void SetPanelCollapsed(bool collapsed)
-    {
-        panelCollapsed = collapsed;
-        EditorPrefs.SetBool(CollapsedKey, collapsed);
         SceneView.RepaintAll();
     }
 
@@ -311,16 +323,7 @@ public static class CuttlefishTransformTool
         scene.wantsMouseMove = true;
         if (e.type == EventType.MouseMove || e.type == EventType.MouseDrag)
             scene.Repaint();
-        // N collapses/expands the UI without disabling Cuttlefish transforms.
-        if (e.type == EventType.KeyDown && e.keyCode == KeyCode.N &&
-            !e.alt && !e.control && !e.command && !e.shift && mode == Mode.None)
-        {
-            SetPanelCollapsed(!panelCollapsed);
-            e.Use();
-            scene.Repaint();
-            return;
-        }
-        if (!panelCollapsed && HandlePanelDrag(e, scene))
+        if (!NativeOverlayActive && HandlePanelDrag(e, scene))
         {
             DrawOverlay(scene);
             return;
@@ -1163,6 +1166,8 @@ public static class CuttlefishTransformTool
     {
         // Keep the overlay fixed-width; only the counter's own label grows.
         float width = 320f;
+        // A floating native overlay always shows the full Cuttlefish controls.
+        // The native overlay system handles compact docked presentation itself.
         float height = mode == Mode.None ? 32f : 67f;
         float x = scene.position.width - width - 16f + panelOffset.x;
         float y = scene.position.height - 32f - 36f + panelOffset.y;
@@ -1171,46 +1176,85 @@ public static class CuttlefishTransformTool
                         width, height);
     }
 
+    // Use the active GUI width rather than relying solely on SceneView.position.
+    // Depending on dock layout the latter can extend past the visible GUI area.
+    private static float VisibleSceneWidth(SceneView scene)
+    {
+        float width = scene.position.width;
+        float guiWidth = EditorGUIUtility.currentViewWidth;
+        if (guiWidth > 0f) width = Mathf.Min(width, guiWidth);
+        return Mathf.Max(1f, width);
+    }
+
+    // Keep the controls click-responsive while allowing dragging from the ENTIRE
+    // surface. Toolbar buttons are protected against accidental activation once
+    // the pointer moves far enough to qualify as a drag.
     private static bool HandlePanelDrag(Event e, SceneView scene)
     {
-        Rect rect = PanelRect(scene);
-        // The narrow left grip is the only draggable region.
-        Rect grip = new Rect(rect.x + 3f, rect.y + 3f, 19f, 26f);
-        if (e.type == EventType.MouseDown && e.button == 0 && grip.Contains(e.mousePosition))
+        Rect hitRect = PanelRect(scene);
+        if (e.type == EventType.MouseDown && e.button == 0)
         {
-            draggingPanel = true;
+            panelDragArmed = hitRect.Contains(e.mousePosition);
+            draggingPanel = false;
+            if (!panelDragArmed) return false;
+
             dragMouseStart = e.mousePosition;
-            dragOffsetStart = panelOffset;
+            dragStartExpandedRect = hitRect;
+
+            // The three toolbar buttons must receive MouseDown normally. Other
+            // regions are a draggable background; consume their MouseDown so
+            // Scene View selection/box select won't run underneath the panel.
+            Rect logo = new Rect(hitRect.x + 27f, hitRect.y + 2f, 28f, 28f);
+            bool hasLogo = GetCuttlefishLogo() != null;
+            Rect add = new Rect(hitRect.x + (hasLogo ? 64f : 27f), hitRect.y + 7f, 72f, 24f);
+            Rect action = new Rect(add.xMax + 8f, add.y, 28f, 24f);
+            if (logo.Contains(e.mousePosition) || add.Contains(e.mousePosition) ||
+                action.Contains(e.mousePosition)) return false;
+
             e.Use();
             return true;
         }
-        if (!draggingPanel) return false;
-        if (e.type == EventType.MouseDrag)
+
+        if (e.type == EventType.MouseDrag && panelDragArmed)
         {
-            panelOffset = dragOffsetStart + e.mousePosition - dragMouseStart;
-            // Clamp against the actual 320px panel bounds, not an old
-            // hard-coded width. Keep the stored offset consistent with the
-            // visible GUI position so scrolling/repainting cannot shift it.
-            Rect clamped = PanelRect(scene);
-            const float panelWidth = 320f;
-            const float rightMargin = 16f;
-            const float bottomAnchor = 32f + 36f;
+            Vector2 delta = e.mousePosition - dragMouseStart;
+            if (!draggingPanel && delta.sqrMagnitude < 16f) return false;
+            if (!draggingPanel)
+            {
+                draggingPanel = true;
+                // If the drag began on a clickable button, release its IMGUI
+                // hot control so MouseUp cannot accidentally click it.
+                GUIUtility.hotControl = 0;
+            }
+
+            const float fullWidth = 320f;
+            float fullHeight = mode == Mode.None ? 32f : 67f;
+            float expandedX = Mathf.Clamp(dragStartExpandedRect.x + delta.x, 0f,
+                Mathf.Max(0f, scene.position.width - fullWidth));
+            float expandedY = Mathf.Clamp(dragStartExpandedRect.y + delta.y, 0f,
+                Mathf.Max(0f, scene.position.height - fullHeight - 20f));
             panelOffset = new Vector2(
-                clamped.x - (scene.position.width - panelWidth - rightMargin),
-                clamped.y - (scene.position.height - bottomAnchor));
+                expandedX - (scene.position.width - fullWidth - 16f),
+                expandedY - (scene.position.height - 32f - 36f));
             scene.Repaint();
             e.Use();
             return true;
         }
-        if (e.type == EventType.MouseUp && e.button == 0)
+
+        if (e.type == EventType.MouseUp && e.button == 0 && panelDragArmed)
         {
+            bool completedDrag = draggingPanel;
+            panelDragArmed = false;
             draggingPanel = false;
+            if (!completedDrag) return false; // Let the clicked button finish.
+
             EditorPrefs.SetFloat(PanelXKey, panelOffset.x);
             EditorPrefs.SetFloat(PanelYKey, panelOffset.y);
+            scene.Repaint();
             e.Use();
             return true;
         }
-        return e.type == EventType.MouseMove;
+        return false;
     }
 
     private static float SafeRatio(float current, float original)
@@ -1737,34 +1781,59 @@ public static class CuttlefishTransformTool
             Handles.DrawSolidDisc(new Vector3(cursor.x, cursor.y, 0f), Vector3.forward, 3.5f);
             Handles.color = oldGuiColor;
         }
-        Rect rect = PanelRect(scene);
-        if (panelCollapsed && mode == Mode.None)
+        if (!NativeOverlayActive)
+            DrawLegacyToolbar(scene);
+        Handles.EndGUI();
+    }
+
+    private static void DrawLegacyToolbar(SceneView scene)
+    {
+        // Compatibility fallback if the native overlay isn't installed.
+        // It always displays the full toolbar: no custom mini/N mode.
+        DrawToolbarContents(scene, PanelRect(scene));
+    }
+
+    // Called by CuttlefishSceneOverlay (Unity's native Overlay system).
+    // It renders the SAME existing toolbar, but in the overlay's local GUI space
+    // instead of manually placing it at a screen coordinate.
+    internal static void DrawNativeOverlayToolbar(SceneView scene)
+    {
+        if (scene == null) return;
+        float height = mode == Mode.None ? 32f : 67f;
+        Rect allocated = GUILayoutUtility.GetRect(320f, height,
+            GUILayout.Width(320f), GUILayout.Height(height));
+        GUI.BeginGroup(allocated);
+        Rect localRect = new Rect(0f, 0f, 320f, height);
+        if (!enabledMode)
         {
-            // Retain the toolbar's right edge so expanding restores its exact position.
-            Rect tab = new Rect(rect.xMax - 38f, rect.y, 38f, 34f);
-            GUI.Box(tab, GUIContent.none, PanelStyle());
-            Texture2D tabLogo = GetCuttlefishLogo();
-            if (tabLogo != null)
-                DrawTintedLogo(new Rect(tab.x + 5f, tab.y + 3f, 28f, 28f), tabLogo);
-            else
-            {
-                GUIStyle fallback = new GUIStyle(EditorStyles.boldLabel)
-                    { alignment = TextAnchor.MiddleCenter, fontSize = 18 };
-                fallback.normal.textColor = new Color(1f, 0.58f, 0.19f);
-                GUI.Label(tab, "C", fallback);
-            }
-            if (GUI.Button(tab, new GUIContent("", "Expand Menu N̲"), GUIStyle.none))
-                SetPanelCollapsed(false);
-            Handles.EndGUI();
-            return;
+            GUI.Box(localRect, GUIContent.none, PanelStyle());
+            if (GUI.Button(new Rect(10f, 4f, 300f, 24f), "Enable Cuttlefish Mode"))
+                ToggleCuttlefishMode();
         }
+        else
+        {
+            DrawToolbarContents(scene, localRect);
+        }
+        GUI.EndGroup();
+    }
+
+    private static void DrawToolbarContents(SceneView scene, Rect rect)
+    {
         GUI.Box(rect, GUIContent.none, PanelStyle());
-        // Three-line drag grip, like Unity's built-in Scene view toolbar.
-        Color gripColor = EditorGUIUtility.isProSkin
-            ? new Color(0.63f, 0.63f, 0.63f, 0.85f)
-            : new Color(0.30f, 0.30f, 0.30f, 0.85f);
-        for (int i = 0; i < 2; i++)
-            EditorGUI.DrawRect(new Rect(rect.x + 11 + i * 3, rect.y + 9, 1.5f, 14), gripColor);
+        // Unity already supplies a drag handle for native overlays. Keep the
+        // original grip only on the legacy floating toolbar, where it can help
+        // signal that the surface is draggable.
+        bool nativeOverlayLayout = NativeOverlayActive;
+        if (!nativeOverlayLayout)
+        {
+            Color gripColor = EditorGUIUtility.isProSkin
+                ? new Color(0.63f, 0.63f, 0.63f, 0.85f)
+                : new Color(0.30f, 0.30f, 0.30f, 0.85f);
+            for (int i = 0; i < 2; i++)
+                EditorGUI.DrawRect(new Rect(rect.x + 11 + i * 3, rect.y + 9, 1.5f, 14), gripColor);
+        }
+        // Reclaim the space from the removed grip in Unity's native overlay.
+        float leadingOffset = nativeOverlayLayout ? -19f : 0f;
         Color titleOrange = new Color(1f, 0.58f, 0.19f);
         GUIStyle title = new GUIStyle(EditorStyles.label) { fontSize = 12 };
         title.normal.textColor = titleOrange;
@@ -1780,12 +1849,11 @@ public static class CuttlefishTransformTool
             fontSize = 12, normal = { textColor = new Color(0.92f, 0.94f, 0.97f) }
         };
         Texture2D logo = GetCuttlefishLogo();
-        Rect logoRect = new Rect(rect.x + 27f, rect.y + 2f, 28f, 28f);
+        Rect logoRect = new Rect(rect.x + 27f + leadingOffset, rect.y + 2f, 28f, 28f);
         if (logo != null)
             DrawTintedLogo(logoRect, logo);
-        if (mode == Mode.None &&
-            GUI.Button(logoRect, new GUIContent("", "Hide Menu N̲"), GUIStyle.none))
-            SetPanelCollapsed(true);
+        // The logo is display-only. Unity's native overlay dragger and docking
+        // strip control the expanded/compact presentation now.
         // Compact raised button; preserve the original logo size and position.
         GUIStyle addButtonStyle = new GUIStyle(EditorStyles.miniButton)
         {
@@ -1803,7 +1871,8 @@ public static class CuttlefishTransformTool
         addButtonStyle.onHover.textColor = Color.white;
         addButtonStyle.onActive.textColor = Color.white;
         addButtonStyle.onFocused.textColor = Color.white;
-        Rect addButtonRect = new Rect(rect.x + (logo != null ? 64f : 27f), rect.y + 7f, 72f, 24f);
+        Rect addButtonRect = new Rect(rect.x + (logo != null ? 64f : 27f) + leadingOffset,
+            rect.y + 7f, 72f, 24f);
         // Render the orange fill *as the button background*, not behind a gray Unity skin.
         GUIStyle orangeButton = new GUIStyle(addButtonStyle);
         orangeButton.normal.background = MakeAddButtonTexture(new Color(0.93f, 0.39f, 0.10f), 72, 24);
@@ -1875,8 +1944,14 @@ public static class CuttlefishTransformTool
             GUI.DrawTexture(new Rect(countX - 17f, rect.y + 9, 15, 15), objectIcon.image, ScaleMode.ScaleToFit);
         if (mode != Mode.None)
         {
-            // Subtle dedicated transform-status bar beneath the branding row.
-            Rect transformBar = new Rect(rect.x + 23f, rect.y + 36f, rect.width - 29f, 24f);
+            // Align the status row with the toolbar's native-overlay left inset.
+            // Moving the whole row together avoids clipping the XYZ fields and
+            // leaves the right edge of the background unchanged.
+            const float nativeStatusInsetAdjustment = 12f;
+            const float statusBarLeftExtension = 6f;
+            float statusShift = nativeOverlayLayout ? nativeStatusInsetAdjustment : 0f;
+            Rect transformBar = new Rect(rect.x + 23f - statusShift - statusBarLeftExtension, rect.y + 36f,
+                rect.width - 29f + statusShift + statusBarLeftExtension, 24f);
             GUI.Box(transformBar, GUIContent.none, TransformBarStyle());
             // Align every control to the same vertical center of the gray bar.
             float barCenterY = transformBar.center.y;
@@ -1889,7 +1964,7 @@ public static class CuttlefishTransformTool
             {
                 Color previousColor = GUI.color;
                 if (ctrlHeld) GUI.color = new Color(0.38f, 1f, 0.48f, 1f);
-                GUI.DrawTexture(new Rect(rect.x + 27, barCenterY - 8f, 16, 16),
+                GUI.DrawTexture(new Rect(rect.x + 27f - statusShift, barCenterY - 8f, 16, 16),
                                 transformIcon.image, ScaleMode.ScaleToFit);
                 GUI.color = previousColor;
             }
@@ -1917,7 +1992,7 @@ public static class CuttlefishTransformTool
             }
             // A small gap after the 16px tool icon; never center the label
             // across the whole operation area.
-            GUI.Label(new Rect(rect.x + 48, barCenterY - 10f, 80, 20), operation, operationStyle);
+            GUI.Label(new Rect(rect.x + 48f - statusShift, barCenterY - 10f, 80, 20), operation, operationStyle);
             Vector3 values = Vector3.zero;
             if (target)
             {
@@ -1937,7 +2012,16 @@ public static class CuttlefishTransformTool
             }
             // Inspector-style inline axis fields: colored letter, then a
             // dark rounded value box with white text, all on one row.
-            float x = rect.x + 131f;
+            // Anchor the whole XYZ cluster to the right edge and squeeze the
+            // value boxes slightly so the operation label has more breathing room.
+            const float axisLabelWidth = 13f;
+            const float axisToBoxGap = 4f;
+            const float valueBoxWidth = 40f;
+            const float valueGroupGap = 4f;
+            const float valuesRightPadding = 3f; // Shift the whole XYZ cluster 7px right.
+            float valueGroupWidth = axisLabelWidth + axisToBoxGap + valueBoxWidth;
+            float totalValuesWidth = valueGroupWidth * 3f + valueGroupGap * 2f;
+            float x = transformBar.xMax - valuesRightPadding - totalValuesWidth;
             for (int i = 0; i < 3; i++)
             {
                 char letter = "XYZ"[i];
@@ -1950,9 +2034,9 @@ public static class CuttlefishTransformTool
                     alignment = TextAnchor.MiddleCenter
                 };
                 axisStyle.normal.textColor = color;
-                GUI.Label(new Rect(x, barCenterY - 9f, 13f, 18f), letter.ToString(), axisStyle);
+                GUI.Label(new Rect(x, barCenterY - 9f, axisLabelWidth, 18f), letter.ToString(), axisStyle);
 
-                Rect valueBox = new Rect(x + 14f, barCenterY - 9.5f, 43f, 19f);
+                Rect valueBox = new Rect(x + axisLabelWidth + axisToBoxGap, barCenterY - 9.5f, valueBoxWidth, 19f);
                 GUIStyle fieldBackground = new GUIStyle(EditorStyles.textField);
                 GUI.Box(valueBox, GUIContent.none, fieldBackground);
 
@@ -1960,15 +2044,17 @@ public static class CuttlefishTransformTool
                 GUIStyle numberStyle = new GUIStyle(EditorStyles.label)
                 {
                     fontSize = 10,
-                    alignment = TextAnchor.MiddleCenter,
-                    clipping = TextClipping.Clip
+                    alignment = TextAnchor.MiddleLeft,
+                    clipping = TextClipping.Clip,
+                    padding = new RectOffset(4, 0, 0, 0)
                 };
                 numberStyle.normal.textColor = Color.white;
                 GUI.Label(valueBox, value.ToString("0.##", CultureInfo.InvariantCulture), numberStyle);
-                x += 61f;
+                x += valueGroupWidth + valueGroupGap;
             }
             // Numeric input is already reflected in the live XYZ values.
         }
-        Handles.EndGUI();
     }
 }
+}
+#endif
